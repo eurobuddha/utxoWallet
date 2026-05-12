@@ -2293,11 +2293,24 @@ body { padding-top: env(safe-area-inset-top, 0); }
       stage("basics", "done");
       stage("check", "done");
       stage("post", "done");
+      // Extract the real txpowid from the txnsign+combined response. The shape
+      // varies between MDS builds; we try the most common nesting first, then
+      // fall back to the internal id so the UPDATE still runs cleanly.
       const realTxnid =
         (post && post.response && post.response.txpow && post.response.txpow.txpowid) ||
         (post && post.response && post.response.txpowid) ||
+        (post && post.response && post.response.txpowdata && post.response.txpowdata.txpowid) ||
         txid;
-      await finalizeHistoryPosted(txid, realTxnid).catch(() => {});
+      try {
+        // Log the response shape (first 600 chars) so future "missing txpowid"
+        // failures are debuggable without a full repro.
+        const summary = JSON.stringify(post || {}).slice(0, 600);
+        MDS.log("utxoWallet.build: txnsign+combined response: " + summary +
+                " | extracted realTxnid=" + realTxnid);
+      } catch {}
+      await finalizeHistoryPosted(txid, realTxnid).catch((err) => {
+        try { MDS.log("utxoWallet.build: finalizeHistoryPosted swallowed: " + JSON.stringify(err)); } catch {}
+      });
       // txndelete:true on txnsign already cleaned the custom-txn record on the node.
       return { txnid: realTxnid, raw: post };
     } catch (err) {
@@ -2553,7 +2566,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
       let coinids = [];
       try { coinids = JSON.parse(row.COINIDS || "[]"); } catch {}
 
-      // (a) Orphan recovery: row stuck at internal id past 30s
+      // (a) Orphan recovery: row stuck at internal id past 30s.
+      // If the custom-txn record is gone from the node AND every input coin is
+      // spent (gone from `coins relevant:true`), the txn DID post — we just lost
+      // the real txpowid because finalizeHistoryPosted didn't get to run.
+      // Promote to `confirmed` (strong on-chain evidence) rather than burying it
+      // as `could_not_confirm`. The row will lack an Explorer-by-hash link, but
+      // the recipient-address search link (see renderHistoryRow) covers that.
       if (txnid && txnid.startsWith("uw_") && ageSecs(ts) > 30) {
         let tlist;
         try { tlist = await mds("txnlist"); } catch { tlist = { response: [] }; }
@@ -2561,8 +2580,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
         if (!stillOnNode) {
           const inputsGone = coinids.length > 0 && coinids.every(cid => !state.coins.find(c => c.coinid === cid));
           if (inputsGone) {
-            await markHistoryStatus(internalid, "could_not_confirm",
-              "Posted but real tx hash not captured. Manual reconciliation needed.").catch(() => {});
+            await markHistoryStatus(internalid, "confirmed",
+              "Verified by on-chain input absence (real txpowid not captured).").catch(() => {});
+            try { MDS.log("utxoWallet.watcher: promoted " + internalid + " to confirmed via input-absence"); } catch {}
           }
         }
         continue;
@@ -2687,9 +2707,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
       actions.appendChild(resumeBtn);
     }
 
-    // Explorer link — visible whenever we have a real on-chain txpowid.
-    // (For internal-id-only rows, the recipient still gives the user a way to
-    // verify manually — note text already says so.)
+    // Explorer link — direct tx link when we have a real on-chain txpowid;
+    // fallback to a recipient-address search otherwise so the user can still
+    // verify visually (rows promoted via input-absence don't carry a txpowid).
     if (hasRealTxid) {
       const a = el("a", {
         class: "history-explorer-link",
@@ -2699,6 +2719,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
         text: "Explorer ↗",
       });
       a.title = "Open this transaction on explorer.minima.global";
+      actions.appendChild(a);
+    } else if (recipientAddr &&
+               (status === "confirmed" || status === "posted" || status === "could_not_confirm")) {
+      const a = el("a", {
+        class: "history-explorer-link",
+        href: "https://explorer.minima.global/search?q=" + encodeURIComponent(recipientAddr),
+        target: "_blank",
+        rel: "noopener noreferrer",
+        text: "Verify recipient ↗",
+      });
+      a.title = "Search the recipient address on explorer.minima.global (real txpowid unavailable).";
       actions.appendChild(a);
     }
 
