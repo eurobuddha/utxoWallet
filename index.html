@@ -1046,7 +1046,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     </div>
   </section>
 
-  <div class="about">utxoWallet · v1.0.0</div>
+  <div class="about" id="aboutLine">utxoWallet</div>
 </div>
 
 <!-- Send modal -->
@@ -1166,6 +1166,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
     lastResumeAttemptBlock: -1,
   };
   const RESUME_THROTTLE_BLOCKS = 2;
+
+  // Build.sh verifies this matches dapp.conf's "version" field and fails the
+  // build on drift, so the "About" line in Settings can't go stale again.
+  const UTXOWALLET_VERSION = "1.0.20";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -2480,29 +2484,36 @@ body { padding-top: env(safe-area-inset-top, 0); }
       stage("basics", "done");
       stage("check", "done");
       stage("post", "done");
-      let realTxnid = extractRealTxnid(post, txid);
-      // Second-chance lookup: if MDS's response shape didn't surface a valid
-      // 0x-hex txpowid anywhere we know to look, scan local history for the
-      // just-broadcast TxPoW whose outputs match our recipient + amount +
-      // tokenid. The local node almost always has it by the time txnsign
-      // returns. Failing-soft — falls back to uw_ id, watcher tries again
-      // on the next NEWBLOCK pass.
-      if (realTxnid === txid) {
-        const looked = await withTimeout(
-          findTxpowidByOutput(recipient, amount, tokenid, sentAtMs - 5000),
-          4000, "findTxpowidByOutput.build"
-        ).catch((err) => {
-          try { MDS.log("utxoWallet.build: findTxpowid timed out / failed: " + JSON.stringify(err)); } catch {}
-          return null;
-        });
-        if (looked) realTxnid = looked;
-      }
+
+      // Local-history scan is the CANONICAL source of the on-chain txpowid.
+      // extractRealTxnid's regex-validated pluck from the txnsign response
+      // can return a wrong-but-well-formed 0x-hex value (e.g., the inner
+      // `transactionid` instead of the outer TxPoW id), which broke the
+      // Explorer ↗ link in v1.0.16–1.0.19. findTxpowidByOutput cross-references
+      // the local TxPoWDB by recipient + amount + tokenid, so anything it
+      // returns is guaranteed indexed under /transactions/<id>.
+      //
+      // If the local node hasn't indexed the freshly-broadcast TxPoW yet
+      // (extremely rare, but possible at boot), fall back to the internal
+      // uw_ id and let the watcher upgrade it on the next NEWBLOCK.
+      let realTxnid = await withTimeout(
+        findTxpowidByOutput(recipient, amount, tokenid, sentAtMs - 5000),
+        4000, "findTxpowidByOutput.build"
+      ).catch((err) => {
+        try { MDS.log("utxoWallet.build: findTxpowid timed out / failed: " + JSON.stringify(err)); } catch {}
+        return null;
+      });
+      if (!realTxnid) realTxnid = txid;
+
       try {
-        // Log the response shape (first 600 chars) so future "missing txpowid"
-        // failures are debuggable without a full repro.
+        // Diagnostic: log both the raw response and what extractRealTxnid would
+        // have picked, alongside the canonical (history-scan) result, so we can
+        // see drift between the two without a full repro.
         const summary = JSON.stringify(post || {}).slice(0, 600);
+        const fromResponse = extractRealTxnid(post, "(uw_fallback)");
         MDS.log("utxoWallet.build: txnsign+combined response: " + summary +
-                " | extracted realTxnid=" + realTxnid);
+                " | response-extracted=" + fromResponse +
+                " | canonical(history)=" + realTxnid);
       } catch {}
       // Track whether finalize actually landed so confirmSend's toast can match
       // the row's true state. If finalize threw (SQL UPDATE failed), the row
@@ -3160,6 +3171,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
   MDS.init(async function (msg) {
     if (msg.event === "inited") {
       wire();
+      try {
+        const aboutEl = document.getElementById("aboutLine");
+        if (aboutEl) aboutEl.textContent = "utxoWallet · v" + UTXOWALLET_VERSION;
+      } catch {}
       try {
         await ensureTable();
         await probeWritePermission();
