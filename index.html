@@ -1474,10 +1474,28 @@ body { padding-top: env(safe-area-inset-top, 0); }
   }
 
   // ─── DB schema + history ───────────────────────────────────────────
+  // Schema migration version. Bump alongside any future ALTER step; ensureTable
+  // applies only the steps whose version exceeds the last-applied marker.
+  const SCHEMA_VERSION = 2;
+
+  async function getSchemaVersionApplied() {
+    return new Promise((resolve) => {
+      try {
+        MDS.keypair.get("utxoWallet.schemaVersion", (res) => {
+          const v = parseInt((res && res.value) || "0", 10);
+          resolve(Number.isFinite(v) ? v : 0);
+        });
+      } catch { resolve(0); }
+    });
+  }
+  function setSchemaVersionApplied(v) {
+    try { MDS.keypair.set("utxoWallet.schemaVersion", String(v), () => {}); } catch {}
+  }
+
   async function ensureTable() {
     // status holds values up to 17 chars (`awaiting_approval`, `could_not_confirm`).
     // varchar(16) silently rejects those UPDATEs in some H2 modes, causing rows to
-    // get stuck mid-flow. varchar(32) gives plenty of headroom.
+    // get stuck mid-flow. varchar(32) gives plenty of headroom for current+future states.
     await sql(
       "CREATE TABLE IF NOT EXISTS `history` (" +
       "  `id` bigint auto_increment PRIMARY KEY," +
@@ -1494,11 +1512,18 @@ body { padding-top: env(safe-area-inset-top, 0); }
       "  `note` varchar(255)" +
       ")"
     );
-    // Defensive migration for installs predating v1.0.11 where status was varchar(16).
-    // ALTER COLUMN is a no-op if the column is already wider; idempotent + safe.
-    await sql("ALTER TABLE `history` ALTER COLUMN `status` VARCHAR(32) NOT NULL").catch((e) => {
-      try { MDS.log("utxoWallet.ensureTable: status-column migration: " + JSON.stringify(e)); } catch {}
-    });
+
+    // One-time migrations for installs predating SCHEMA_VERSION. Skipped on subsequent
+    // boots via the MDS.keypair marker.
+    const applied = await getSchemaVersionApplied();
+    if (applied < 2) {
+      // v2: widen status column from varchar(16) → varchar(32) (idempotent on fresh
+      // tables). Any failure is logged but doesn't block init.
+      await sql("ALTER TABLE `history` ALTER COLUMN `status` VARCHAR(32) NOT NULL").catch((e) => {
+        try { MDS.log("utxoWallet.ensureTable: status-column migration v2: " + JSON.stringify(e)); } catch {}
+      });
+    }
+    if (applied < SCHEMA_VERSION) setSchemaVersionApplied(SCHEMA_VERSION);
   }
   function sqlQuote(s) {
     // Single-quote-escape for SQL string literals. Pair with regex pre-validation;
@@ -2201,9 +2226,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
     go.disabled = true; back.disabled = true;
 
     try {
-      await buildTransaction(pendingPreview, setStage);
+      const result = await buildTransaction(pendingPreview, setStage);
       markPriorStagesDone("__done__");
-      toast("Transaction posted ✓", "success");
+      // Toast matches actual row state — finalize may have silently failed
+      // (in which case the watcher's input-absence path will rescue within 30s).
+      if (result && result.finalizeOk === false) {
+        toast("Broadcast accepted — finalize deferred, see History.", "warn");
+      } else {
+        toast("Transaction posted ✓", "success");
+      }
       // Clear selection + close
       state.selected.clear();
       state.selectedTokenid = null;
@@ -2232,6 +2263,27 @@ body { padding-top: env(safe-area-inset-top, 0); }
       back.disabled = false;
       go.disabled = false;
     }
+  }
+
+  // One-shot finale used by both buildTransaction's success path and
+  // resumePendingBuild's finalize step. Per docs.minima.global/docs/development/simple-txn,
+  // `txnsign publickey:auto txnpostauto:true txndelete:true` is the canonical
+  // short form for default-wallet-address sends — signs, adds MMR proofs +
+  // scripts, posts, and deletes the custom-txn record in a single MDS command.
+  // Centralised here so flag changes don't drift between the two call sites.
+  function signAndPost(txid, tokenid, burn) {
+    const burnParam = (tokenid === "0x00" && isPositive(burn || "0")) ? ` txnpostburn:${burn}` : "";
+    return mds(`txnsign id:${txid} publickey:auto txnpostauto:true txndelete:true${burnParam}`);
+  }
+  // Extract the real on-chain txpowid from a txnsign+combined response. The
+  // shape varies across MDS builds; we try the known nestings in order and
+  // fall back to the supplied txid (internal `uw_...`) so downstream UPDATEs
+  // still run cleanly.
+  function extractRealTxnid(post, fallbackTxid) {
+    return (post && post.response && post.response.txpow && post.response.txpow.txpowid) ||
+           (post && post.response && post.response.txpowid) ||
+           (post && post.response && post.response.txpowdata && post.response.txpowdata.txpowid) ||
+           fallbackTxid;
   }
 
   // ─── buildTransaction ──────────────────────────────────────────────
@@ -2287,20 +2339,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
       // Limit/feedback_minima_tx is specifically about script-address coins, which we
       // never construct.
       stage("sign", "active");
-      const burnParam = (tokenid === "0x00" && isPositive(burn)) ? ` txnpostburn:${burn}` : "";
-      const post = await mds(`txnsign id:${txid} publickey:auto txnpostauto:true txndelete:true${burnParam}`);
+      const post = await signAndPost(txid, tokenid, burn);
       stage("sign", "done");
       stage("basics", "done");
       stage("check", "done");
       stage("post", "done");
-      // Extract the real txpowid from the txnsign+combined response. The shape
-      // varies between MDS builds; we try the most common nesting first, then
-      // fall back to the internal id so the UPDATE still runs cleanly.
-      const realTxnid =
-        (post && post.response && post.response.txpow && post.response.txpow.txpowid) ||
-        (post && post.response && post.response.txpowid) ||
-        (post && post.response && post.response.txpowdata && post.response.txpowdata.txpowid) ||
-        txid;
+      const realTxnid = extractRealTxnid(post, txid);
       try {
         // Log the response shape (first 600 chars) so future "missing txpowid"
         // failures are debuggable without a full repro.
@@ -2308,11 +2352,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
         MDS.log("utxoWallet.build: txnsign+combined response: " + summary +
                 " | extracted realTxnid=" + realTxnid);
       } catch {}
+      // Track whether finalize actually landed so confirmSend's toast can match
+      // the row's true state. If finalize threw (SQL UPDATE failed), the row
+      // stays at "posting" until the watcher's input-absence rescue runs; the
+      // user shouldn't see "Transaction posted ✓" while the row contradicts it.
+      let finalizeOk = true;
       await finalizeHistoryPosted(txid, realTxnid).catch((err) => {
+        finalizeOk = false;
         try { MDS.log("utxoWallet.build: finalizeHistoryPosted swallowed: " + JSON.stringify(err)); } catch {}
       });
       // txndelete:true on txnsign already cleaned the custom-txn record on the node.
-      return { txnid: realTxnid, raw: post };
+      return { txnid: realTxnid, raw: post, finalizeOk };
     } catch (err) {
       // PENDING is recoverable — preserve everything for resumePendingBuild() to pick up.
       if (err && err.stage === "pending") {
@@ -2400,6 +2450,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
     // txndelete can race the other's in-flight txnbasics → corrupted history row.
     if (state.resumeInFlight) {
       try { MDS.log("utxoWallet.resume: already in flight, skipping"); } catch {}
+      // Only surface to the user when they triggered this themselves;
+      // auto-resume skips should be silent.
+      if (opts.manual) {
+        toast("Another resume is already running — try again in a moment.", "warn");
+      }
       return;
     }
     state.resumeInFlight = true;
@@ -2431,8 +2486,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
             state.chainBlock - state.lastResumeAttemptBlock < RESUME_THROTTLE_BLOCKS) {
           return;
         }
-        state.lastResumeAttemptBlock = state.chainBlock;
       }
+      // Record EVERY attempt (auto + manual) so the throttle accounting reflects
+      // actual MDS round-trips, not just auto runs.
+      if (state.chainBlock > 0) state.lastResumeAttemptBlock = state.chainBlock;
 
       // STEP 2 — verify the txn still exists on the node.
       let chkRes;
@@ -2473,14 +2530,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
       // - If something pends, roll back to awaiting_approval; the user approves once more.
       // - Hard failure: NO txndelete (orphan waits for the sweeper in WRITE mode).
       try {
-        const tokenid = pa.context.tokenid;
-        const burn = pa.context.burn || "0";
-        const burnParam = (tokenid === "0x00" && isPositive(burn)) ? ` txnpostburn:${burn}` : "";
-        const post = await mds(`txnsign id:${pa.txid} publickey:auto txnpostauto:true txndelete:true${burnParam}`);
-        const realTxnid =
-          (post && post.response && post.response.txpow && post.response.txpow.txpowid) ||
-          (post && post.response && post.response.txpowid) ||
-          pa.txid;
+        const post = await signAndPost(pa.txid, pa.context.tokenid, pa.context.burn || "0");
+        const realTxnid = extractRealTxnid(post, pa.txid);
         await finalizeHistoryPosted(pa.internalid, realTxnid).catch(()=>{});
         state.pendingApproval = null;
         if (state.pendingTxId === pa.txid) state.pendingTxId = null;
@@ -2566,26 +2617,34 @@ body { padding-top: env(safe-area-inset-top, 0); }
       let coinids = [];
       try { coinids = JSON.parse(row.COINIDS || "[]"); } catch {}
 
-      // (a) Orphan recovery: row stuck at internal id past 30s.
-      // If the custom-txn record is gone from the node AND every input coin is
-      // spent (gone from `coins relevant:true`), the txn DID post — we just lost
-      // the real txpowid because finalizeHistoryPosted didn't get to run.
-      // Promote to `confirmed` (strong on-chain evidence) rather than burying it
-      // as `could_not_confirm`. The row will lack an Explorer-by-hash link, but
-      // the recipient-address search link (see renderHistoryRow) covers that.
+      // (a) Orphan recovery for rows whose txnid never got upgraded to a real
+      // txpowid. Three outcomes here:
+      //   - Txn still on node (build still in flight) → leave alone, wait.
+      //   - Txn gone AND inputs spent → strong evidence it posted, promote to
+      //     `confirmed` ("Verified by on-chain input absence").
+      //   - Txn gone AND inputs still present → unusual; fall through to (c)
+      //     timeout so the row eventually settles instead of sitting forever.
+      // The early `continue` ONLY applies to the first two cases — never on the
+      // "fall through to (c)" case.
       if (txnid && txnid.startsWith("uw_") && ageSecs(ts) > 30) {
         let tlist;
         try { tlist = await mds("txnlist"); } catch { tlist = { response: [] }; }
         const stillOnNode = ((tlist && tlist.response) || []).some(t => t.id === txnid);
-        if (!stillOnNode) {
-          const inputsGone = coinids.length > 0 && coinids.every(cid => !state.coins.find(c => c.coinid === cid));
-          if (inputsGone) {
-            await markHistoryStatus(internalid, "confirmed",
-              "Verified by on-chain input absence (real txpowid not captured).").catch(() => {});
-            try { MDS.log("utxoWallet.watcher: promoted " + internalid + " to confirmed via input-absence"); } catch {}
-          }
+        if (stillOnNode) {
+          // Build still active on the node — don't touch.
+          continue;
         }
-        continue;
+        const inputsGone = coinids.length > 0 && coinids.every(cid => !state.coins.find(c => c.coinid === cid));
+        if (inputsGone) {
+          await markHistoryStatus(internalid, "confirmed",
+            "Verified by on-chain input absence (real txpowid not captured).").catch(() => {});
+          try { MDS.log("utxoWallet.watcher: promoted " + internalid + " to confirmed via input-absence"); } catch {}
+          continue;
+        }
+        // Txn gone but inputs still present — likely the build never broadcast
+        // (denied / hard failure on node). Let the (c) timeout below decide
+        // between `rejected` and `could_not_confirm` once the 5-minute window
+        // elapses, rather than getting stuck here forever.
       }
 
       // (b) Positive evidence: TxPoW in local history index AND in a block
