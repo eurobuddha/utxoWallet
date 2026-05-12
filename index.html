@@ -784,15 +784,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
   letter-spacing: 1.2px;
   border: 1px solid;
 }
-.status-pill.posting           { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
-.status-pill.awaiting_approval { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
-.status-pill.finalizing        { color: var(--blue);   border-color: var(--blue-soft);     background: var(--blue-soft); }
-.status-pill.posted            { color: var(--blue);   border-color: var(--blue-soft);     background: var(--blue-soft); }
+/* v1.0.14: 5 user-facing pill buckets. Internal SQL still uses the 9 granular
+   codes — statusBucket() maps each to one of these classes. */
+.status-pill.sending           { color: var(--dim);    border-color: var(--border2);       background: var(--surface2); }
+.status-pill.action_needed     { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
+.status-pill.broadcasting      { color: var(--blue);   border-color: var(--blue-soft);     background: var(--blue-soft); }
 .status-pill.confirmed         { color: var(--accent); border-color: var(--accent-soft);   background: var(--accent-soft); }
-.status-pill.rejected          { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
-.status-pill.error             { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
-.status-pill.expired           { color: var(--dim);    border-color: var(--border2);       background: var(--surface2); }
-.status-pill.could_not_confirm { color: var(--dim);    border-color: var(--border2);       background: var(--surface2); }
+.status-pill.issue             { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
 
 /* ── Settings ──────────────────────────────────────────────────────── */
 .setting-block { padding: 14px 0; border-bottom: 1px solid var(--border); }
@@ -2685,8 +2683,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
     // If any rows are currently stuck in flight, surface a banner above the list
     // pointing the user at the most likely cause (READ-mode pending dance).
     const inFlight = state.history.filter(r => {
-      const s = String(r.STATUS || "");
-      return s === "awaiting_approval" || s === "finalizing";
+      const b = statusBucket(String(r.STATUS || ""));
+      return b === "action_needed" || b === "sending";
     });
     if (inFlight.length > 0 && !state.settings.writeConfirmed) {
       const banner = el("div", { class: "write-gate" },
@@ -2710,12 +2708,31 @@ body { padding-top: env(safe-area-inset-top, 0); }
     }
     for (const row of state.history) body.appendChild(renderHistoryRow(row));
   }
+  // The dapp tracks 9 granular internal SQL statuses; the user sees these 5
+  // buckets. Keep the buckets in lockstep with the .status-pill CSS classes.
+  function statusBucket(s) {
+    switch (s) {
+      case "posting":
+      case "finalizing":         return "sending";
+      case "awaiting_approval":  return "action_needed";
+      case "posted":             return "broadcasting";
+      case "confirmed":          return "confirmed";
+      case "error":
+      case "rejected":
+      case "expired":
+      case "could_not_confirm":  return "issue";
+      default:                   return "sending";
+    }
+  }
   function statusLabel(s) {
-    if (s === "awaiting_approval") return "Approve in MiniHub";
-    if (s === "finalizing")        return "Finalizing…";
-    if (s === "could_not_confirm") return "Could not confirm";
-    if (s === "expired")           return "Expired";
-    return s.replace(/_/g, " ");
+    switch (statusBucket(s)) {
+      case "sending":        return "Sending";
+      case "action_needed":  return "Action needed";
+      case "broadcasting":   return "Broadcasting";
+      case "confirmed":      return "Confirmed";
+      case "issue":          return "Issue";
+      default:               return s;
+    }
   }
   function renderHistoryRow(row) {
     const card = el("div", { class: "history-row" });
@@ -2738,7 +2755,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
         el("span", { class: "dir-badge " + dir, text: dirLabel }),
         el("span", { class: "history-time", text: date }),
       ),
-      el("span", { class: "status-pill " + status, text: statusLabel(status), title: row.NOTE || "" }),
+      el("span", { class: "status-pill " + statusBucket(status), text: statusLabel(status), title: row.NOTE || "" }),
     ));
     card.appendChild(el("div", { class: "history-body" },
       el("div", { class: "to", text: truncMid(recipientAddr, 14, 10) }),
@@ -2749,9 +2766,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
     footRow.appendChild(el("span", { text: hasRealTxid ? truncMid(txid, 8, 6) : "tx hash pending…" }));
     const actions = el("div", { class: "history-foot-actions" });
 
-    // Resume button on awaiting_approval AND finalizing rows. `finalizing` may
-    // be stuck if the dapp closed mid-resume — manual force-retry path.
-    if (status === "awaiting_approval" || status === "finalizing") {
+    // Resume button on "action_needed" (awaiting_approval) AND "sending" rows
+    // whose internal code is `finalizing` — both are recoverable in-flight
+    // states where a manual nudge can complete the chain. Plain `posting` rows
+    // are too fresh to retry; the watcher handles them.
+    const bucket = statusBucket(status);
+    if (bucket === "action_needed" || status === "finalizing") {
       const resumeBtn = el("button", { class: "history-resume-btn", text: "Resume now" });
       resumeBtn.title = "Force a finalize attempt now — tap this after approving the latest pending action in MiniHub.";
       resumeBtn.addEventListener("click", (ev) => {
@@ -2780,7 +2800,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       a.title = "Open this transaction on explorer.minima.global";
       actions.appendChild(a);
     } else if (recipientAddr &&
-               (status === "confirmed" || status === "posted" || status === "could_not_confirm")) {
+               (bucket === "confirmed" || bucket === "broadcasting" || bucket === "issue")) {
       const a = el("a", {
         class: "history-explorer-link",
         href: "https://explorer.minima.global/search?q=" + encodeURIComponent(recipientAddr),
@@ -2792,8 +2812,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
       actions.appendChild(a);
     }
 
-    // Dismiss button on terminal-state rows that can't progress further.
-    if (status === "could_not_confirm" || status === "error" || status === "expired" || status === "rejected") {
+    // Dismiss button on terminal "issue" rows (error/rejected/expired/could_not_confirm).
+    if (bucket === "issue") {
       const dismissBtn = el("button", { class: "history-dismiss-btn", text: "Dismiss" });
       dismissBtn.title = "Permanently remove this row from your history.";
       dismissBtn.addEventListener("click", (ev) => {
@@ -2809,9 +2829,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
     footRow.appendChild(actions);
     card.appendChild(footRow);
 
-    // "Waiting for confirmation…" indicator on posted rows that haven't been
-    // verified on-chain yet. Watcher flips them to `confirmed` on next NEWBLOCK.
-    if (status === "posted") {
+    // "Waiting for confirmation…" indicator on broadcasting-bucket rows that
+    // haven't been verified on-chain yet. Watcher flips them to `confirmed` on
+    // the next NEWBLOCK (or via input-absence within ~30s).
+    if (bucket === "broadcasting") {
       card.appendChild(el("div", { class: "confirm-pending",
         text: "Broadcasting — waiting for confirmation on the next block." }));
     }
