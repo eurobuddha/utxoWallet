@@ -661,6 +661,24 @@ body { padding-top: env(safe-area-inset-top, 0); }
   gap: 10px;
 }
 .history-foot-actions { display: flex; gap: 10px; align-items: center; }
+
+/* Direction badge: rows are always outgoing for v1.x, but call it out explicitly
+   so the user doesn't have to guess. */
+.dir-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  font-family: inherit;
+}
+.dir-badge.out  { color: var(--red);    border: 1px solid var(--red-border);   background: var(--red-soft); }
+.dir-badge.self { color: var(--dim);    border: 1px solid var(--border2);      background: var(--surface2); }
+.dir-badge.in   { color: var(--accent); border: 1px solid var(--accent-soft);  background: var(--accent-soft); }
 .history-resume-btn {
   background: var(--accent);
   color: #000;
@@ -946,7 +964,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
       <div class="setting-block">
         <div class="setting-title">WRITE permission</div>
-        <div class="setting-desc">utxoWallet needs WRITE permission to sign transactions. Without it, every send is silently queued in MiniHub's Pending Actions.</div>
+        <div class="setting-desc">
+          <b>Strongly recommended:</b> grant utxoWallet WRITE permission in MiniHub. With WRITE, sends complete in one tap. In READ mode each build step queues a separate Pending Action you must approve manually — and any approval queue race can leave the History row stuck. Right-click utxoWallet in MiniHub → <i>Write mode</i>.
+        </div>
         <div class="perm-state" id="permState">
           <div class="label" id="permLabel">Checking…</div>
           <button class="btn small ghost" id="retestBtn">Re-test</button>
@@ -1329,10 +1349,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
     try { list = await mds("txnlist"); } catch { return; }
     const txns = (list && list.response) || [];
 
-    // Build the protected set from history rows that are awaiting approval.
+    // Build the protected set from history rows that are still in-flight (either
+    // awaiting user approval in MiniHub, or in the brief `finalizing` window). A
+    // `finalizing` row indicates the dapp crashed or was reloaded while the
+    // post-approval finalize was running — we must NOT reap the txid here, the
+    // resume on next boot will reconcile it.
     let protectedIds = new Set();
     try {
-      const rows = await sql("SELECT internalid FROM history WHERE status='awaiting_approval'");
+      const rows = await sql(
+        "SELECT internalid FROM history WHERE status IN ('awaiting_approval', 'finalizing')"
+      );
       for (const r of rows) {
         const id = r.INTERNALID;
         if (id && validateTxnId(id)) protectedIds.add(id);
@@ -1362,7 +1388,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       try {
         const rows = await sql(
           "SELECT internalid, txnid, ts, recipient, amount, tokenid, coinids, changeaddr, burn " +
-          "FROM history WHERE status='awaiting_approval' ORDER BY ts DESC LIMIT 1"
+          "FROM history WHERE status IN ('awaiting_approval', 'finalizing') ORDER BY ts DESC LIMIT 1"
         );
         if (rows.length) {
           const r = rows[0];
@@ -2427,7 +2453,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
   async function watchPendingConfirmations() {
     let rows;
     try {
-      rows = await sql("SELECT internalid, txnid, ts, coinids FROM history WHERE status IN ('posting','posted') ORDER BY ts ASC");
+      rows = await sql("SELECT internalid, txnid, ts, coinids FROM history WHERE status IN ('posting','posted','finalizing') ORDER BY ts ASC");
     } catch { return; }
     const ageSecs = (ts) => (Date.now() - parseInt(ts, 10)) / 1000;
 
@@ -2487,6 +2513,25 @@ body { padding-top: env(safe-area-inset-top, 0); }
   function renderHistory() {
     const body = document.getElementById("historyBody");
     clearNode(body);
+
+    // If any rows are currently stuck in flight, surface a banner above the list
+    // pointing the user at the most likely cause (READ-mode pending dance).
+    const inFlight = state.history.filter(r => {
+      const s = String(r.STATUS || "");
+      return s === "awaiting_approval" || s === "finalizing";
+    });
+    if (inFlight.length > 0 && !state.settings.writeConfirmed) {
+      const banner = el("div", { class: "write-gate" },
+        el("b", null, "Stuck in READ-mode pending? "),
+        document.createTextNode(
+          "Approve the queued actions in MiniHub Pending Actions and then tap " +
+          "“Resume now” on any row that doesn’t advance. For one-tap sends, grant " +
+          "WRITE permission in Settings."
+        ),
+      );
+      body.appendChild(banner);
+    }
+
     if (!state.history.length) {
       body.appendChild(el("div", { class: "empty" },
         el("div", { class: "glyph" }, "📜"),
@@ -2514,18 +2559,30 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const txid = String(row.TXNID || "");
     const internalid = String(row.INTERNALID || "");
 
+    // Direction — every row this dapp writes is a SEND.
+    // If the recipient is one of our wallet addresses, it's a self-send.
+    const recipientAddr = String(row.RECIPIENT || "");
+    const dir = state.myWalletAddresses.has(recipientAddr) ? "self" : "out";
+    const dirLabel = dir === "self" ? "↻ Self" : "↑ Out";
+
     card.appendChild(el("div", { class: "history-head" },
-      el("span", { class: "history-time", text: date }),
+      el("div", { style: { display: "flex", gap: "8px", alignItems: "center" } },
+        el("span", { class: "dir-badge " + dir, text: dirLabel }),
+        el("span", { class: "history-time", text: date }),
+      ),
       el("span", { class: "status-pill " + status, text: statusLabel(status), title: row.NOTE || "" }),
     ));
     card.appendChild(el("div", { class: "history-body" },
-      el("div", { class: "to", text: truncMid(String(row.RECIPIENT || ""), 14, 10) }),
+      el("div", { class: "to", text: truncMid(recipientAddr, 14, 10) }),
       el("div", { class: "amt", text: `${formatAmount(amt)} ${tokenLabel(tok)}` }),
     ));
     const footRow = el("div", { class: "history-foot" });
     footRow.appendChild(el("span", { text: txid && !txid.startsWith("uw_") ? truncMid(txid, 8, 6) : "tx hash pending…" }));
     const actions = el("div", { class: "history-foot-actions" });
-    if (status === "awaiting_approval") {
+    // Resume button available on both awaiting_approval AND finalizing rows.
+    // `finalizing` can be a stuck state if the dapp closed mid-resume — the
+    // button lets the user force a fresh attempt.
+    if (status === "awaiting_approval" || status === "finalizing") {
       const resumeBtn = el("button", { class: "history-resume-btn", text: "Resume now" });
       resumeBtn.title = "Force a finalize attempt now — tap this after approving the latest pending action in MiniHub.";
       resumeBtn.addEventListener("click", (ev) => {
