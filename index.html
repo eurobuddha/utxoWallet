@@ -1475,12 +1475,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // ─── DB schema + history ───────────────────────────────────────────
   async function ensureTable() {
+    // status holds values up to 17 chars (`awaiting_approval`, `could_not_confirm`).
+    // varchar(16) silently rejects those UPDATEs in some H2 modes, causing rows to
+    // get stuck mid-flow. varchar(32) gives plenty of headroom.
     await sql(
       "CREATE TABLE IF NOT EXISTS `history` (" +
       "  `id` bigint auto_increment PRIMARY KEY," +
       "  `internalid` varchar(64) NOT NULL UNIQUE," +
       "  `txnid` varchar(80) NOT NULL," +
-      "  `status` varchar(16) NOT NULL," +
+      "  `status` varchar(32) NOT NULL," +
       "  `recipient` varchar(80) NOT NULL," +
       "  `amount` varchar(64) NOT NULL," +
       "  `tokenid` varchar(80) NOT NULL," +
@@ -1491,6 +1494,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
       "  `note` varchar(255)" +
       ")"
     );
+    // Defensive migration for installs predating v1.0.11 where status was varchar(16).
+    // ALTER COLUMN is a no-op if the column is already wider; idempotent + safe.
+    await sql("ALTER TABLE `history` ALTER COLUMN `status` VARCHAR(32) NOT NULL").catch((e) => {
+      try { MDS.log("utxoWallet.ensureTable: status-column migration: " + JSON.stringify(e)); } catch {}
+    });
   }
   function sqlQuote(s) {
     // Single-quote-escape for SQL string literals. Pair with regex pre-validation;
@@ -1519,20 +1527,43 @@ body { padding-top: env(safe-area-inset-top, 0); }
     await sql("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT 500)").catch(() => {});
   }
   async function finalizeHistoryPosted(internalid, realTxnid) {
-    if (!validateTxnId(internalid)) return;
+    if (!validateTxnId(internalid)) {
+      try { MDS.log("utxoWallet.finalizeHistoryPosted: bad internalid=" + internalid); } catch {}
+      return;
+    }
     const safeTxnid = sqlQuote(String(realTxnid));
-    await sql(`UPDATE history SET txnid='${safeTxnid}', status='posted' WHERE internalid='${sqlQuote(internalid)}'`);
+    try {
+      await sql(`UPDATE history SET txnid='${safeTxnid}', status='posted' WHERE internalid='${sqlQuote(internalid)}'`);
+    } catch (err) {
+      try { MDS.log("utxoWallet.finalizeHistoryPosted FAILED: " + JSON.stringify(err)); } catch {}
+      toast("Could not update history row to 'posted' — see MDS log.", "error");
+      throw err;
+    }
   }
   async function markHistoryStatus(internalid, status, note) {
-    if (!validateTxnId(internalid)) return;
+    if (!validateTxnId(internalid)) {
+      try { MDS.log("utxoWallet.markHistoryStatus: bad internalid=" + internalid); } catch {}
+      return;
+    }
     const noteFrag = note ? `, note='${sqlQuote(note)}'` : "";
-    await sql(`UPDATE history SET status='${sqlQuote(status)}'${noteFrag} WHERE internalid='${sqlQuote(internalid)}'`);
+    try {
+      await sql(`UPDATE history SET status='${sqlQuote(status)}'${noteFrag} WHERE internalid='${sqlQuote(internalid)}'`);
+    } catch (err) {
+      try { MDS.log("utxoWallet.markHistoryStatus FAILED status=" + status + " err=" + JSON.stringify(err)); } catch {}
+      // Don't toast for every status update; the callers handle UX. Just log.
+      throw err;
+    }
   }
   // Permanently removes a history row. User-initiated only — used by the
-  // Dismiss button on terminal-state rows (could_not_confirm / error).
+  // Dismiss button on terminal-state rows.
   async function dismissHistoryRow(internalid) {
     if (!validateTxnId(internalid)) return;
-    await sql(`DELETE FROM history WHERE internalid='${sqlQuote(internalid)}'`);
+    try {
+      await sql(`DELETE FROM history WHERE internalid='${sqlQuote(internalid)}'`);
+    } catch (err) {
+      try { MDS.log("utxoWallet.dismissHistoryRow FAILED: " + JSON.stringify(err)); } catch {}
+      toast("Could not dismiss row — see MDS log.", "error");
+    }
   }
   async function loadHistory() {
     try {
