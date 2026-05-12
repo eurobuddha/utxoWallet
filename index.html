@@ -2318,7 +2318,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
   async function findTxpowidByOutput(recipient, amount, tokenid, sentAtMs) {
     if (!recipient) return null;
     let histRes;
-    try { histRes = await mds("history relevant:true max:50"); }
+    try { histRes = await mds("history relevant:true max:1000"); }
     catch (e) {
       try { MDS.log("utxoWallet.findTxpowid: history fetch failed: " + JSON.stringify(e)); } catch {}
       return null;
@@ -2330,6 +2330,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const TXPOWID_RE = /^0x[0-9a-fA-F]{64}$/;
     const wantTokenid = tokenid || "0x00";
     const wantAmtNorm = normalizeAmount(String(amount));
+    const wantAmtStr  = String(amount);
+    // Token outputs store the raw Minima-scale value on `amount` and the
+    // human-readable form on `tokenamount` (Limit/feedback_minima_tx.md:60-64).
+    // Minima outputs (tokenid 0x00) use `amount` for the human-readable value.
+    // Try both fields and accept either match.
+    const matchAmt = (s) => {
+      if (!s) return false;
+      const t = String(s);
+      return t === wantAmtStr || normalizeAmount(t) === wantAmtNorm;
+    };
 
     for (const tp of txpows) {
       // Skip block-only TxPoWs — only the transaction-carrying ones have outputs we care about.
@@ -2337,21 +2347,36 @@ body { padding-top: env(safe-area-inset-top, 0); }
       const txpowid = tp.txpowid;
       if (!txpowid || !TXPOWID_RE.test(txpowid)) continue;
 
+      // Timestamp filter — REFUSE to match without a usable TxPoW timestamp.
+      // A degenerate row with tsMs=0 could otherwise match an unrelated TxPoW.
       const tsMs = parseInt((tp.header && tp.header.timemilli) || 0, 10);
-      if (tsMs && sentAtMs && tsMs + slackMs < sentAtMs) continue;
+      if (!tsMs) continue;
+      if (sentAtMs && tsMs + slackMs < sentAtMs) continue;
 
       const outs = (tp.body && tp.body.txn && tp.body.txn.outputs) || [];
       for (const o of outs) {
         const oTok = o.tokenid || "0x00";
         if (oTok !== wantTokenid) continue;
         if (o.address !== recipient && o.miniaddress !== recipient) continue;
-        const oAmt = String(o.amount != null ? o.amount : (o.tokenamount || ""));
-        if (oAmt !== String(amount) && normalizeAmount(oAmt) !== wantAmtNorm) continue;
+        if (!matchAmt(o.amount) && !matchAmt(o.tokenamount)) continue;
         try { MDS.log("utxoWallet.findTxpowid: matched " + txpowid + " for " + recipient); } catch {}
         return txpowid;
       }
     }
     return null;
+  }
+
+  // Promise.race wrapper used to bound slow MDS calls. `history relevant:true`
+  // is documented as "can be slow"; we don't want a stalled history scan to
+  // wedge the user's send-completion UX.
+  function withTimeout(promise, ms, label) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(
+        () => reject({ stage: "timeout", label, ms }),
+        ms
+      )),
+    ]);
   }
 
   // Extract the real on-chain txpowid from a txnsign+combined response. The
@@ -2448,8 +2473,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
       // returns. Failing-soft — falls back to uw_ id, watcher tries again
       // on the next NEWBLOCK pass.
       if (realTxnid === txid) {
-        const looked = await findTxpowidByOutput(recipient, amount, tokenid, sentAtMs - 5000)
-                              .catch(() => null);
+        const looked = await withTimeout(
+          findTxpowidByOutput(recipient, amount, tokenid, sentAtMs - 5000),
+          4000, "findTxpowidByOutput.build"
+        ).catch((err) => {
+          try { MDS.log("utxoWallet.build: findTxpowid timed out / failed: " + JSON.stringify(err)); } catch {}
+          return null;
+        });
         if (looked) realTxnid = looked;
       }
       try {
@@ -2748,9 +2778,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
           // recipient ↗ fallback.
           let upgraded = false;
           if (txnid && txnid.startsWith("uw_") && row.RECIPIENT) {
-            const looked = await findTxpowidByOutput(
-              row.RECIPIENT, row.AMOUNT, row.TOKENID, parseInt(row.TS, 10) - 5000
-            ).catch(() => null);
+            const looked = await withTimeout(
+              findTxpowidByOutput(
+                row.RECIPIENT, row.AMOUNT, row.TOKENID, parseInt(row.TS, 10) - 5000
+              ),
+              4000, "findTxpowidByOutput.watcher"
+            ).catch((err) => {
+              try { MDS.log("utxoWallet.watcher: findTxpowid timed out / failed: " + JSON.stringify(err)); } catch {}
+              return null;
+            });
             if (looked) {
               await finalizeHistoryPosted(internalid, looked).catch(() => {});
               try { MDS.log("utxoWallet.watcher: " + internalid + " → confirmed with real txpowid via local history"); } catch {}
