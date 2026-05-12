@@ -33,6 +33,7 @@
   --blue: #6699ff;
   --blue-soft: rgba(102, 153, 255, 0.10);
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --nav-h: 56px;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -342,7 +343,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 /* ── Selection bar (sticky) ────────────────────────────────────────── */
 .selection-bar {
   position: sticky;
-  top: 56px;
+  top: var(--nav-h);
   z-index: 30;
   margin: -2px -16px 14px;
   padding: 12px 16px;
@@ -1045,7 +1046,6 @@ body { padding-top: env(safe-area-inset-top, 0); }
       lastWriteConfirmedAt: 0,
     },
     lastChangeFallbackReason: null,
-    confirmedFirstWrite: false,        // gate for keypair persistence
     history: [],                       // last loaded
     loadCoinsTimer: null,              // debounce handle
     debugMyAddr: null,                 // first default address (for receive modal)
@@ -1058,6 +1058,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
   const DEFAULT_WALLET_SCRIPT_RE =
     /^\s*RETURN\s+SIGNEDBY\s*\(\s*0x[0-9a-fA-F]+\s*\)\s*$/i;
   const VALID_INTERNAL_ID_RE = /^uw_[a-z0-9_]{8,40}$/;
+  // Canonical decimal-number regex — used by validateAmount, validateBurn,
+  // and the "do we have a usable amount yet?" check inside validateSendInputs.
+  // Keep these in lockstep — drift caused inconsistent validation in v1.0.2.
+  const AMOUNT_RE = /^(0|[1-9][0-9]*)(\.[0-9]{1,44})?$/;
 
   // ─── MDS wrappers ──────────────────────────────────────────────────
   function redact(cmd) {
@@ -1147,7 +1151,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
   }
   function validateAmount(amt, max) {
     const s = String(amt).trim();
-    if (!/^(0|[1-9][0-9]*)(\.[0-9]{1,44})?$/.test(s)) return { ok: false, err: "format" };
+    if (!AMOUNT_RE.test(s)) return { ok: false, err: "format" };
     if (bigEq(s, "0")) return { ok: false, err: "nonpositive" };
     if (bigGt(s, max)) return { ok: false, err: "exceeds" };
     return { ok: true, normalized: normalizeAmount(s) };
@@ -1155,7 +1159,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
   function validateBurn(b) {
     const s = String(b == null ? "" : b).trim();
     if (s === "") return { ok: true, normalized: "0" };
-    if (!/^(0|[1-9][0-9]*)(\.[0-9]{1,44})?$/.test(s)) return { ok: false, err: "format" };
+    if (!AMOUNT_RE.test(s)) return { ok: false, err: "format" };
     return { ok: true, normalized: normalizeAmount(s) };
   }
   function validateTxnId(id) {
@@ -1341,8 +1345,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
   async function loadHistory() {
     try {
       state.history = await sql("SELECT * FROM history ORDER BY id DESC LIMIT 500");
-    } catch {
-      state.history = [];
+    } catch (err) {
+      // Keep prior history visible; failures here are almost always transient.
+      try { MDS.log("utxoWallet loadHistory error: " + JSON.stringify(err)); } catch {}
+      toast("Could not refresh history.", "error");
     }
     renderHistory();
   }
@@ -1359,10 +1365,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
     let res;
     try { res = await mds("coins relevant:true"); }
     catch (err) {
+      // Don't blank state.coins — keeping the last-known view is safer than
+      // a sudden empty wallet that looks like funds vanished.
       if (err && err.stage === "pending") {
-        // Read-only commands shouldn't be pending, but defensive.
         toast("Could not read coins — permission issue.", "error");
+      } else {
+        toast("Could not load coins — see log.", "error");
+        try { MDS.log("utxoWallet loadCoins error: " + JSON.stringify(err)); } catch {}
       }
+      renderWallet();
+      renderSelectionBar();
       return;
     }
     state.coins = (res && res.response) || [];
@@ -1564,8 +1576,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
     const amtEl = el("div", { class: "utxo-amt", text: formatAmount(coinAmt(c)) });
 
-    // Coinid: last 6 chars only, full id in title tooltip — UX address is the card header
-    const idShort = "…" + c.coinid.slice(-6);
+    // Coinid: last 8 chars only, full id in title tooltip — UX address is the card header
+    const idShort = "…" + c.coinid.slice(-8);
     const idEl = el("div", { class: "utxo-id", text: idShort, title: c.coinid });
 
     const copyBtn = el("button", { class: "row-copy", type: "button", text: "copy" });
@@ -1664,7 +1676,6 @@ body { padding-top: env(safe-area-inset-top, 0); }
   }
 
   // ─── Send modal ────────────────────────────────────────────────────
-  let lastChangeResolved = null;
   async function openSendModal() {
     if (state.selected.size === 0) return;
     if (!state.settings.writeConfirmed) {
@@ -1702,12 +1713,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
     document.getElementById("burnNote").className = "field-note info";
     document.getElementById("burnNote").textContent = isMinima ? "" : "Burn is only for Minima sends.";
 
-    // Resolve default change addr (calls getaddress — cycles the 64 defaults; NEVER newaddress)
-    lastChangeResolved = null;
+    // Resolve default change addr (calls getaddress — cycles the 64 defaults; NEVER newaddress).
+    // resolveDefaultChangeAddr() sets state.lastChangeFallbackReason when "first" mode falls back.
+    // We deliberately keep that reason set across validateSendInputs so the safety note is shown;
+    // it's cleared in the changeInput "input" handler (i.e., when the user touches the field).
     state.lastChangeFallbackReason = null;
     try {
       const ch = await resolveDefaultChangeAddr(selected[0]);
-      lastChangeResolved = ch;
       document.getElementById("changeInput").value = ch || "";
     } catch {
       document.getElementById("changeInput").value = "";
@@ -1716,10 +1728,6 @@ body { padding-top: env(safe-area-inset-top, 0); }
     setNote("recipientNote", "", "");
     setNote("amountNote", "", "");
     setNote("changeNote", "", "");
-    if (state.lastChangeFallbackReason) {
-      setNote("changeNote", `Using next default address — ${state.lastChangeFallbackReason}.`, "info");
-      state.lastChangeFallbackReason = null;
-    }
 
     document.getElementById("sendModal").classList.add("open");
     setTimeout(() => document.getElementById("recipientInput").focus(), 80);
@@ -1792,7 +1800,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     if (!amount) { setNote("amountNote", "", ""); ok = false; }
     else {
       const maxSpendable = isMinima ? bigSub(total, burnNorm) : total;
-      if (bigGt("0", maxSpendable) || bigEq(maxSpendable, "0")) {
+      if (!isPositive(maxSpendable)) {
         setNote("amountNote", "Burn exceeds total — nothing left to send.", "error"); ok = false;
       } else {
         const av = validateAmount(amount, maxSpendable);
@@ -1805,16 +1813,25 @@ body { padding-top: env(safe-area-inset-top, 0); }
       }
     }
 
-    // change
+    // change — preserve the rotate-fallback explanation if it's active;
+    // recognition badge is informational only and would otherwise overwrite the safety note.
     if (!change) {
       // allow empty only if amount + burn === total exactly (no change)
-      if (amount && /^(0|[1-9][0-9]*)(\.[0-9]+)?$/.test(amount)) {
+      if (amount && AMOUNT_RE.test(amount)) {
         const used = bigAdd(amount, burnNorm);
         if (bigEq(used, total)) setNote("changeNote", "No change — full amount sent.", "ok");
         else { setNote("changeNote", "Change address required.", "error"); ok = false; }
       } else {
         setNote("changeNote", "", "");
         ok = false;
+      }
+    } else if (state.lastChangeFallbackReason) {
+      // Show the fallback reason instead of the recognition badge.
+      // Validate format so we still gate ok=false on a malformed address.
+      if (!validateAddress(change)) {
+        setNote("changeNote", "Invalid address format", "error"); ok = false;
+      } else {
+        setNote("changeNote", `Using next default address — ${state.lastChangeFallbackReason}`, "info");
       }
     } else {
       const rc = addrRecognition(change);
@@ -2259,6 +2276,14 @@ body { padding-top: env(safe-area-inset-top, 0); }
     for (const id of ["recipientInput", "amountInput", "changeInput", "burnInput"]) {
       document.getElementById(id).addEventListener("input", validateSendInputs);
     }
+    // User editing the change field means they've seen / dismissed the fallback note.
+    document.getElementById("changeInput").addEventListener("input", () => {
+      state.lastChangeFallbackReason = null;
+    });
+    // Likewise, clicking [next] explicitly picks a fresh default — the reason no longer applies.
+    document.getElementById("newAddrBtn").addEventListener("click", () => {
+      state.lastChangeFallbackReason = null;
+    });
     // Confirm modal
     document.getElementById("confirmBackBtn").addEventListener("click", backToSend);
     document.getElementById("confirmGoBtn").addEventListener("click", confirmSend);
@@ -2312,8 +2337,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
         state.chainBlock = parseInt((msg.data && msg.data.txpow && msg.data.txpow.header && msg.data.txpow.header.block) || 0, 10) || state.chainBlock;
         document.getElementById("blockNo").textContent = "#" + (state.chainBlock || "—");
       } catch {}
-      debouncedLoadCoins();
-      watchPendingConfirmations().catch(() => {});
+      // Reconcile pending history rows ONLY after coins have been refreshed for this block —
+      // otherwise the orphan-recovery path sees stale state.coins and waits an extra block.
+      // (NEWBALANCE still debounces — multiple balance changes per second cluster harmlessly.)
+      loadCoins()
+        .then(() => watchPendingConfirmations())
+        .catch(() => {});
     } else if (msg.event === "MDSFAIL") {
       const err = (msg.data && msg.data.error) || "MDS command failed";
       toast(err, "error");
