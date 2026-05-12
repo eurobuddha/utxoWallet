@@ -917,10 +917,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
       <div class="setting-block">
         <div class="setting-title">Default change address</div>
         <div class="setting-desc">Where the difference between your inputs and the recipient amount goes.</div>
-        <label class="radio-row"><input type="radio" name="changeMode" value="fresh">
-          <div class="text"><div class="head">Fresh</div><div class="sub">A brand-new address each send. Best privacy. Mints a new keypair.</div></div></label>
+        <label class="radio-row"><input type="radio" name="changeMode" value="rotate">
+          <div class="text"><div class="head">Rotate</div><div class="sub">Cycle through your 64 default addresses. Better privacy, all keys backed up by your seed phrase.</div></div></label>
         <label class="radio-row"><input type="radio" name="changeMode" value="first">
-          <div class="text"><div class="head">First input</div><div class="sub">Re-use the source coin's address. Compact, but addresses are reused — less private.</div></div></label>
+          <div class="text"><div class="head">First input</div><div class="sub">Send change back to the source coin's address. Compact — re-uses one of your default addresses.</div></div></label>
       </div>
 
       <div class="setting-block">
@@ -966,7 +966,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     <div class="field">
       <div class="field-label">
         <span class="label">Change goes to</span>
-        <button class="action" type="button" id="newAddrBtn">new</button>
+        <button class="action" type="button" id="newAddrBtn">next</button>
       </div>
       <input type="text" id="changeInput" placeholder="Mx…" autocomplete="off" spellcheck="false">
       <div class="field-note" id="changeNote"></div>
@@ -1036,12 +1036,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
     selectedTokenid: null,
     myWalletAddresses: new Set(),
     myScriptAddresses: new Set(),
-    sessionMintedAddresses: new Set(),
     chainBlock: 0,
     activeTab: "wallet",
     pendingTxId: null,
     settings: {
-      defaultChangeMode: "fresh",      // "fresh" | "first"
+      defaultChangeMode: "rotate",     // "rotate" (cycle through 64 defaults) | "first" (re-use source coin's address)
       writeConfirmed: false,
       lastWriteConfirmedAt: 0,
     },
@@ -1429,7 +1428,6 @@ body { padding-top: env(safe-area-inset-top, 0); }
         nextWallet.add(c.address);
       }
     }
-    for (const a of state.sessionMintedAddresses) nextWallet.add(a);
     state.myWalletAddresses = nextWallet;
     state.myScriptAddresses = nextScripts;
   }
@@ -1704,7 +1702,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     document.getElementById("burnNote").className = "field-note info";
     document.getElementById("burnNote").textContent = isMinima ? "" : "Burn is only for Minima sends.";
 
-    // Resolve default change addr (may call newaddress)
+    // Resolve default change addr (calls getaddress — cycles the 64 defaults; NEVER newaddress)
     lastChangeResolved = null;
     state.lastChangeFallbackReason = null;
     try {
@@ -1719,7 +1717,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     setNote("amountNote", "", "");
     setNote("changeNote", "", "");
     if (state.lastChangeFallbackReason) {
-      setNote("changeNote", `Falling back to fresh — ${state.lastChangeFallbackReason}.`, "info");
+      setNote("changeNote", `Using next default address — ${state.lastChangeFallbackReason}.`, "info");
       state.lastChangeFallbackReason = null;
     }
 
@@ -1731,8 +1729,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
     document.getElementById("sendModal").classList.remove("open");
   }
   async function resolveDefaultChangeAddr(firstCoin) {
-    if (state.settings.defaultChangeMode === "fresh") {
-      return await mintFreshChangeAddr();
+    if (state.settings.defaultChangeMode === "rotate") {
+      return await getNextDefaultChangeAddr();
     }
     // "first" mode — only if source is in myWalletAddresses
     if (state.myWalletAddresses.has(firstCoin.address)) return firstCoin.address;
@@ -1741,16 +1739,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
     } else {
       state.lastChangeFallbackReason = "source not in your known wallet addresses";
     }
-    return await mintFreshChangeAddr();
+    return await getNextDefaultChangeAddr();
   }
-  async function mintFreshChangeAddr() {
-    const r = await mds("newaddress");
-    const minted = (r && r.response && (r.response.miniaddress || r.response.address)) || "";
-    if (minted) {
-      state.sessionMintedAddresses.add(minted);
-      state.myWalletAddresses.add(minted);
-    }
-    return minted;
+  // Always uses `getaddress`, which cycles the 64 seed-derived default addresses.
+  // NEVER call `newaddress` — it mints a keypair outside the default set and is lost on seed re-sync.
+  async function getNextDefaultChangeAddr() {
+    const r = await mds("getaddress");
+    const addr = (r && r.response && (r.response.miniaddress || r.response.address)) || "";
+    if (addr) state.myWalletAddresses.add(addr);
+    return addr;
   }
   function setNote(id, msg, kind) {
     const n = document.getElementById(id);
@@ -1840,15 +1837,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
       validateSendInputs();
     }
   }
-  async function newChangeAddr() {
+  async function nextChangeAddr() {
     try {
-      const minted = await mintFreshChangeAddr();
-      if (minted) {
-        document.getElementById("changeInput").value = minted;
+      const next = await getNextDefaultChangeAddr();
+      if (next) {
+        document.getElementById("changeInput").value = next;
         validateSendInputs();
       }
     } catch (err) {
-      toast(err && err.message ? err.message : "Could not mint a new address.", "error");
+      toast(err && err.message ? err.message : "Could not fetch next default address.", "error");
     }
   }
 
@@ -2208,7 +2205,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       r.checked = (r.value === state.settings.defaultChangeMode);
       r.onchange = () => {
         state.settings.defaultChangeMode = r.value;
-        toast(`Change mode: ${r.value === "fresh" ? "Fresh address per send" : "Re-use first input"}`, "");
+        toast(`Change mode: ${r.value === "rotate" ? "Rotate through 64 default addresses" : "Re-use first input's address"}`, "");
       };
     }
     renderSettingsPermBlock();
@@ -2258,7 +2255,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     document.getElementById("sendCancelBtn").addEventListener("click", closeSendModal);
     document.getElementById("previewBtn").addEventListener("click", previewTx);
     document.getElementById("maxBtn").addEventListener("click", setMaxAmount);
-    document.getElementById("newAddrBtn").addEventListener("click", newChangeAddr);
+    document.getElementById("newAddrBtn").addEventListener("click", nextChangeAddr);
     for (const id of ["recipientInput", "amountInput", "changeInput", "burnInput"]) {
       document.getElementById(id).addEventListener("input", validateSendInputs);
     }

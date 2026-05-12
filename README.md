@@ -28,6 +28,10 @@ detect READ-only and gate the Send button (a hard block, not a soft warning).
 
 ## Safety model
 
+- **Only uses your 64 seed-derived default addresses.** Change addresses come
+  from `getaddress` (which cycles the defaults). Never calls `newaddress` — a
+  `newaddress` keypair lives outside the default set and is silently lost on a
+  seed re-sync.
 - Strict 3-step posting: `txnsign` → `txnbasics` → `txncheck` → `txnpost`.
   Never `txnpost auto:true` (silent Script-FAIL trap).
 - `txncheck` confirms `valid.basic && valid.scripts` before any tx is broadcast.
