@@ -697,12 +697,14 @@ body { padding-top: env(safe-area-inset-top, 0); }
   letter-spacing: 1.2px;
   border: 1px solid;
 }
-.status-pill.posting   { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
-.status-pill.posted    { color: var(--blue);   border-color: var(--blue-soft);     background: var(--blue-soft); }
-.status-pill.confirmed { color: var(--accent); border-color: var(--accent-soft);   background: var(--accent-soft); }
-.status-pill.rejected  { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
-.status-pill.error     { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
-.status-pill.could_not_confirm { color: var(--dim); border-color: var(--border2); background: var(--surface2); }
+.status-pill.posting           { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
+.status-pill.awaiting_approval { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); animation: pulse 1.8s ease-in-out infinite; }
+.status-pill.posted            { color: var(--blue);   border-color: var(--blue-soft);     background: var(--blue-soft); }
+.status-pill.confirmed         { color: var(--accent); border-color: var(--accent-soft);   background: var(--accent-soft); }
+.status-pill.rejected          { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
+.status-pill.error             { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
+.status-pill.expired           { color: var(--dim);    border-color: var(--border2);       background: var(--surface2); }
+.status-pill.could_not_confirm { color: var(--dim);    border-color: var(--border2);       background: var(--surface2); }
 
 /* ── Settings ──────────────────────────────────────────────────────── */
 .setting-block { padding: 14px 0; border-bottom: 1px solid var(--border); }
@@ -1049,7 +1051,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
     history: [],                       // last loaded
     loadCoinsTimer: null,              // debounce handle
     debugMyAddr: null,                 // first default address (for receive modal)
+    // Set when a mid-chain `pending` response is detected and we're awaiting MiniHub approval.
+    // Shape: { internalid, txid, stage, atBlock, context: { recipient, amount, change, burn, tokenid, changeAmt, coinids } }
+    // Resumed from `resumePendingBuild()` on NEWBLOCK. Cleared on success, hard failure, or 20-block expiry.
+    pendingApproval: null,
   };
+
+  // How many blocks an `awaiting_approval` row may live before we give up on it.
+  // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
+  // user to spot the notification and approve, not so long that orphan ids accumulate.
+  const APPROVAL_EXPIRY_BLOCKS = 20;
 
   // Token decimals cache (for nicer display only — math is BigInt-string-safe)
   const TOKEN_NAMES = new Map();
@@ -1068,15 +1079,26 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const s = String(cmd);
     return s.slice(0, 28) + (s.length > 28 ? "…" : "");
   }
+  // Detect both response shapes MDS uses for "queued for approval":
+  //   1. `{pending: true, ...}`
+  //   2. `{status: false, error: "...pending..."}`
+  // Wager's `isPending(res)` (Wager/js/app.js:102-106) is the canonical detector.
+  function isPendingResponse(res) {
+    if (!res) return false;
+    if (res.pending === true) return true;
+    if (res.status === false && typeof res.error === "string" &&
+        res.error.toLowerCase().indexOf("pending") >= 0) return true;
+    return false;
+  }
   function mds(cmd) {
     return new Promise((resolve, reject) => {
       try {
         MDS.cmd(cmd, (res) => {
           if (!res) return reject({ stage: "no-response", cmd: redact(cmd) });
-          if (res.pending) return reject({
+          if (isPendingResponse(res)) return reject({
             stage: "pending",
             cmd: redact(cmd),
-            message: "Command queued in MiniHub Pending Actions — utxoWallet needs WRITE permission to send.",
+            message: "Command queued in MiniHub Pending Actions — approve to continue.",
           });
           if (res.status === false || res.error) return reject({
             stage: "mds-error",
@@ -1094,6 +1116,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
     return new Promise((resolve, reject) => {
       try {
         MDS.sql(query, (res) => {
+          if (isPendingResponse(res)) return reject({
+            stage: "sql-pending",
+            query: String(query).slice(0, 80),
+            message: "SQL queued unexpectedly — cannot record history without WRITE permission.",
+          });
           if (!res || res.status === false) return reject({
             stage: "sql",
             query: String(query).slice(0, 80),
@@ -1270,20 +1297,60 @@ body { padding-top: env(safe-area-inset-top, 0); }
   }
 
   // ─── Stale-txn sweeper ─────────────────────────────────────────────
+  // Reaps orphan `uw_…` ids on the node — EXCEPT those whose history row is
+  // currently `awaiting_approval`. The user may still be approving them in
+  // MiniHub; deleting the txid here would break the resume path.
   async function sweepStaleTxns() {
     let list;
     try { list = await mds("txnlist"); } catch { return; }
     const txns = (list && list.response) || [];
-    let cleaned = 0;
+
+    // Build the protected set from history rows that are awaiting approval.
+    let protectedIds = new Set();
+    try {
+      const rows = await sql("SELECT internalid FROM history WHERE status='awaiting_approval'");
+      for (const r of rows) {
+        const id = r.INTERNALID;
+        if (id && validateTxnId(id)) protectedIds.add(id);
+      }
+    } catch { /* if history is unreadable, fall through and sweep nothing protected */ }
+
+    let cleaned = 0, skipped = 0;
     for (const t of txns) {
       const id = t && t.id;
-      if (id && validateTxnId(id)) {
-        await mds(`txndelete id:${id}`).catch(() => {});
-        cleaned++;
-      }
+      if (!id || !validateTxnId(id)) continue;
+      if (protectedIds.has(id)) { skipped++; continue; }
+      await mds(`txndelete id:${id}`).catch(() => {});
+      cleaned++;
     }
-    if (cleaned > 0) {
-      try { MDS.log(`utxoWallet: swept ${cleaned} stale txn id(s)`); } catch {}
+    if (cleaned > 0 || skipped > 0) {
+      try { MDS.log(`utxoWallet: swept ${cleaned} stale txn id(s), preserved ${skipped} awaiting approval`); } catch {}
+    }
+
+    // Re-attach a pending-approval state if we found a protected row but our in-memory
+    // pendingApproval is empty (i.e., dapp was relaunched mid-pending). The protected row
+    // has all the context we need for resumePendingBuild to finish the chain.
+    if (!state.pendingApproval && protectedIds.size > 0) {
+      try {
+        const rows = await sql(
+          "SELECT internalid, txnid, ts, recipient, amount, tokenid, coinids, changeaddr, burn " +
+          "FROM history WHERE status='awaiting_approval' ORDER BY ts DESC LIMIT 1"
+        );
+        if (rows.length) {
+          const r = rows[0];
+          let coinids = [];
+          try { coinids = JSON.parse(r.COINIDS || "[]"); } catch {}
+          state.pendingApproval = {
+            internalid: r.INTERNALID, txid: r.TXNID, stage: "resume", atBlock: state.chainBlock,
+            context: {
+              recipient: r.RECIPIENT, amount: r.AMOUNT, change: r.CHANGEADDR || "",
+              burn: r.BURN || "0", tokenid: r.TOKENID, changeAmt: "0", coinids,
+            },
+          };
+          state.pendingTxId = r.TXNID;
+          try { MDS.log("utxoWallet: re-attached pendingApproval for " + r.INTERNALID); } catch {}
+        }
+      } catch {}
     }
   }
 
@@ -1978,7 +2045,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     go.disabled = true; back.disabled = true;
 
     try {
-      const result = await buildTransaction(pendingPreview, setStage);
+      await buildTransaction(pendingPreview, setStage);
       markPriorStagesDone("__done__");
       toast("Transaction posted ✓", "success");
       // Clear selection + close
@@ -1991,6 +2058,19 @@ body { padding-top: env(safe-area-inset-top, 0); }
       tabSwitch("history");
       await loadCoins();
     } catch (err) {
+      // PENDING is not a failure — the toast inside buildTransaction explains it,
+      // resumePendingBuild() will complete on the next NEWBLOCK. Close the modals
+      // and route the user to History so they can watch the status pill.
+      if (err && err.recoverable) {
+        state.selected.clear();
+        state.selectedTokenid = null;
+        pendingPreview = null;
+        closeConfirmModal();
+        renderWallet();
+        renderSelectionBar();
+        tabSwitch("history");
+        return;
+      }
       const msg = err && err.message ? err.message : (err && err.error ? err.error : "Send failed.");
       toast(msg, "error");
       back.disabled = false;
@@ -1999,26 +2079,26 @@ body { padding-top: env(safe-area-inset-top, 0); }
   }
 
   // ─── buildTransaction ──────────────────────────────────────────────
+  // Tracks `currentStage` so the catch can stash the right resume-point on pending.
+  // A `pending` rejection mid-chain is NOT a failure — we preserve state.pendingApproval
+  // and finish the chain in `resumePendingBuild()` on the next NEWBLOCK after the user
+  // approves in MiniHub. Critically: do NOT `txndelete` on pending — that would itself
+  // queue and race the original command into producing an unrecoverable mess.
   async function buildTransaction(preview, onStage) {
     const { selectedCoins: sel, recipient, amount, change, burn, tokenid, changeAmt } = preview;
     const txid = "uw_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
     const tokParam = (tokenid === "0x00") ? "" : ` tokenid:${tokenid}`;
     let recorded = false;
-    const stage = (n, k) => { try { onStage && onStage(n, k); } catch {} };
+    let currentStage = "init";
+    const stage = (n, k) => { currentStage = n; try { onStage && onStage(n, k); } catch {} };
 
     try {
       stage("record", "active");
       await recordHistoryPosting({
-        internalid: txid,
-        txnid: txid,
-        status: "posting",
-        recipient,
-        amount,
-        tokenid,
+        internalid: txid, txnid: txid, status: "posting",
+        recipient, amount, tokenid,
         coinids: sel.map(c => c.coinid),
-        changeaddr: change || "",
-        burn: burn || "0",
-        ts: Date.now(),
+        changeaddr: change || "", burn: burn || "0", ts: Date.now(),
       });
       recorded = true;
       stage("record", "done");
@@ -2070,6 +2150,28 @@ body { padding-top: env(safe-area-inset-top, 0); }
       await mds(`txndelete id:${txid}`).catch(() => {});
       return { txnid: realTxnid, raw: post };
     } catch (err) {
+      // PENDING is recoverable — preserve everything for resumePendingBuild() to pick up.
+      if (err && err.stage === "pending") {
+        state.pendingApproval = {
+          internalid: txid, txid, stage: currentStage, atBlock: state.chainBlock,
+          context: {
+            recipient, amount, change, burn, tokenid,
+            changeAmt: String(changeAmt),
+            coinids: sel.map(c => c.coinid),
+          },
+        };
+        if (recorded) {
+          await markHistoryStatus(txid, "awaiting_approval",
+            "Stage '" + currentStage + "' queued in MiniHub. Approve to finish.").catch(()=>{});
+        }
+        toast("Approval needed in MiniHub Pending Actions. The transaction will finish automatically once approved.", "warn");
+        try { MDS.notify("utxoWallet: approve pending action in MiniHub to complete your send."); } catch {}
+        // DO NOT txndelete here. DO NOT clear state.pendingTxId here either —
+        // it stays "claimed" until resumePendingBuild succeeds or expires.
+        throw { stage: "pending", message: "Awaiting approval.", txid, recoverable: true };
+      }
+
+      // Hard failure — release everything.
       if (state.pendingTxId === txid) {
         await mds(`txndelete id:${txid}`).catch(() => {});
       }
@@ -2078,7 +2180,73 @@ body { padding-top: env(safe-area-inset-top, 0); }
       }
       throw { stage: (err && err.stage) || "unknown", message: (err && err.message) || (err && err.error) || String(err), txid };
     } finally {
-      if (state.pendingTxId === txid) state.pendingTxId = null;
+      // Only release the in-flight slot if there's no pending approval pending us.
+      if (state.pendingTxId === txid && !state.pendingApproval) state.pendingTxId = null;
+      renderSelectionBar();
+    }
+  }
+
+  // ─── resumePendingBuild ───────────────────────────────────────────
+  // Called from NEWBLOCK handler when state.pendingApproval is set. Picks up the
+  // chain from whatever stage paused. txnsign is NEVER retried — once the user
+  // approves in MiniHub, the node's queued command consumes the key-use and the
+  // txn is signed; running txnsign again would burn a second use for no benefit.
+  // We always pick up at txnbasics → txncheck → txnpost.
+  async function resumePendingBuild() {
+    if (!state.pendingApproval) return;
+    const pa = state.pendingApproval;
+
+    // Expiry guard — if the user never approves, don't sit on the txid forever.
+    if (state.chainBlock - pa.atBlock > APPROVAL_EXPIRY_BLOCKS) {
+      await mds(`txndelete id:${pa.txid}`).catch(()=>{});
+      await markHistoryStatus(pa.internalid, "expired",
+        `Approval not received within ${APPROVAL_EXPIRY_BLOCKS} blocks.`).catch(()=>{});
+      state.pendingApproval = null;
+      if (state.pendingTxId === pa.txid) state.pendingTxId = null;
+      toast("Approval window expired — transaction cancelled.", "warn");
+      renderSelectionBar();
+      return;
+    }
+
+    try {
+      // The node may still be queuing earlier stages if the user hasn't approved yet —
+      // each call below will reject with stage:"pending" and we'll wait for the next block.
+      // Pick up from txnbasics onward regardless of which stage originally paused,
+      // because the node executes the approved chain in order.
+      await mds(`txnbasics id:${pa.txid}`);
+      const chk = await mds(`txncheck id:${pa.txid}`);
+      const v = (chk && chk.response && chk.response.valid) || {};
+      if (v.basic === false || v.scripts === false) {
+        throw { stage: "txncheck", message: "Validation failed after approval (basic=" + v.basic + ", scripts=" + v.scripts + ")." };
+      }
+      const tokenid = pa.context.tokenid;
+      const burn = pa.context.burn || "0";
+      const burnParam = (tokenid === "0x00" && isPositive(burn)) ? ` burn:${burn}` : "";
+      const post = await mds(`txnpost id:${pa.txid}${burnParam}`);
+      const realTxnid =
+        (post && post.response && post.response.txpow && post.response.txpow.txpowid) ||
+        (post && post.response && post.response.txpowid) ||
+        pa.txid;
+      await finalizeHistoryPosted(pa.internalid, realTxnid).catch(()=>{});
+      await mds(`txndelete id:${pa.txid}`).catch(()=>{});
+      state.pendingApproval = null;
+      if (state.pendingTxId === pa.txid) state.pendingTxId = null;
+      toast("Approved transaction posted ✓", "success");
+      try { MDS.notify("utxoWallet: transaction posted after approval."); } catch {}
+      if (state.activeTab === "history") loadHistory();
+      renderSelectionBar();
+    } catch (err) {
+      if (err && err.stage === "pending") {
+        // Still queued — leave state.pendingApproval set; next NEWBLOCK retries.
+        return;
+      }
+      // Hard failure after approval — give up cleanly.
+      await mds(`txndelete id:${pa.txid}`).catch(()=>{});
+      await markHistoryStatus(pa.internalid, "error",
+        "Resume failed after approval: " + ((err && err.message) || (err && err.error) || "unknown")).catch(()=>{});
+      state.pendingApproval = null;
+      if (state.pendingTxId === pa.txid) state.pendingTxId = null;
+      toast("Transaction failed after approval — see History.", "error");
       renderSelectionBar();
     }
   }
@@ -2157,6 +2325,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
     }
     for (const row of state.history) body.appendChild(renderHistoryRow(row));
   }
+  function statusLabel(s) {
+    if (s === "awaiting_approval") return "Approve in MiniHub";
+    if (s === "could_not_confirm") return "Could not confirm";
+    if (s === "expired") return "Expired";
+    return s.replace(/_/g, " ");
+  }
   function renderHistoryRow(row) {
     const card = el("div", { class: "history-row" });
     const status = String(row.STATUS || "");
@@ -2169,7 +2343,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
     card.appendChild(el("div", { class: "history-head" },
       el("span", { class: "history-time", text: date }),
-      el("span", { class: "status-pill " + status, text: status.replace(/_/g, " ") }),
+      el("span", { class: "status-pill " + status, text: statusLabel(status), title: row.NOTE || "" }),
     ));
     card.appendChild(el("div", { class: "history-body" },
       el("div", { class: "to", text: truncMid(String(row.RECIPIENT || ""), 14, 10) }),
@@ -2337,10 +2511,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
         state.chainBlock = parseInt((msg.data && msg.data.txpow && msg.data.txpow.header && msg.data.txpow.header.block) || 0, 10) || state.chainBlock;
         document.getElementById("blockNo").textContent = "#" + (state.chainBlock || "—");
       } catch {}
-      // Reconcile pending history rows ONLY after coins have been refreshed for this block —
-      // otherwise the orphan-recovery path sees stale state.coins and waits an extra block.
-      // (NEWBALANCE still debounces — multiple balance changes per second cluster harmlessly.)
+      // Order matters: loadCoins → resumePendingBuild → watchPendingConfirmations.
+      // - loadCoins refreshes state.coins so the watcher's orphan-recovery sees this block's reality.
+      // - resumePendingBuild picks up any awaiting-approval chain (no-op if state.pendingApproval is null).
+      // - watchPendingConfirmations reconciles posted/posting rows against the local TxPoWDB.
       loadCoins()
+        .then(() => state.pendingApproval ? resumePendingBuild() : null)
         .then(() => watchPendingConfirmations())
         .catch(() => {});
     } else if (msg.event === "MDSFAIL") {
