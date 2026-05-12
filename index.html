@@ -661,6 +661,22 @@ body { padding-top: env(safe-area-inset-top, 0); }
   gap: 10px;
 }
 .history-foot-actions { display: flex; gap: 10px; align-items: center; }
+.history-resume-btn {
+  background: var(--accent);
+  color: #000;
+  border: none;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.history-resume-btn:hover:not(:disabled) { background: var(--accent2); }
+.history-resume-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .history-detail-toggle {
   font-size: 9px;
   color: var(--accent);
@@ -1000,10 +1016,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       <div class="stage" data-stage="create">Building transaction</div>
       <div class="stage" data-stage="inputs">Adding inputs</div>
       <div class="stage" data-stage="outputs">Adding outputs</div>
-      <div class="stage" data-stage="sign">Signing</div>
-      <div class="stage" data-stage="basics">Generating proofs</div>
-      <div class="stage" data-stage="check">Validating</div>
-      <div class="stage" data-stage="post">Posting to network</div>
+      <div class="stage" data-stage="sign">Signing &amp; posting</div>
     </div>
     <div class="modal-actions">
       <button class="btn ghost" id="confirmBackBtn">Back</button>
@@ -1061,7 +1074,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
     // Single-flight guard for resumePendingBuild — NEWBLOCK and the manual Resume button
     // can both invoke it; without this guard their awaits interleave and corrupt history rows.
     resumeInFlight: false,
+    // Throttle for auto-resume in READ mode: each MDS write queues a separate approval,
+    // so we MUST avoid spam-queuing on every NEWBLOCK. The auto path runs at most every
+    // `RESUME_THROTTLE_BLOCKS`. The manual Resume button always bypasses this throttle.
+    lastResumeAttemptBlock: -1,
   };
+  const RESUME_THROTTLE_BLOCKS = 2;
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -2145,32 +2163,27 @@ body { padding-top: env(safe-area-inset-top, 0); }
       }
       stage("outputs", "done");
 
+      // One-shot finale: sign + MMR proofs + scripts + post + delete, ALL in a single
+      // MDS command. Per official Minima docs (docs.minima.global/docs/development/simple-txn),
+      // this is the canonical short form for default-wallet-address sends. Reduces the
+      // READ-mode pending count from 3-to-1 here and eliminates multi-step resume
+      // orchestration. SAFE because txnsign explicit `publickey:auto` properly signs
+      // default `RETURN SIGNEDBY(<pubkey>)` scripts — the "never auto:true" warning in
+      // Limit/feedback_minima_tx is specifically about script-address coins, which we
+      // never construct.
       stage("sign", "active");
-      await mds(`txnsign id:${txid} publickey:auto`);
+      const burnParam = (tokenid === "0x00" && isPositive(burn)) ? ` txnpostburn:${burn}` : "";
+      const post = await mds(`txnsign id:${txid} publickey:auto txnpostauto:true txndelete:true${burnParam}`);
       stage("sign", "done");
-
-      stage("basics", "active");
-      await mds(`txnbasics id:${txid}`);
       stage("basics", "done");
-
-      stage("check", "active");
-      const chk = await mds(`txncheck id:${txid}`);
-      const v = (chk && chk.response && chk.response.valid) || {};
-      if (v.basic === false || v.scripts === false) {
-        throw { stage: "txncheck", message: "Transaction failed validation (basic=" + v.basic + ", scripts=" + v.scripts + ")." };
-      }
       stage("check", "done");
-
-      stage("post", "active");
-      const burnParam = (tokenid === "0x00" && isPositive(burn)) ? ` burn:${burn}` : "";
-      const post = await mds(`txnpost id:${txid}${burnParam}`);
       stage("post", "done");
       const realTxnid =
         (post && post.response && post.response.txpow && post.response.txpow.txpowid) ||
         (post && post.response && post.response.txpowid) ||
         txid;
       await finalizeHistoryPosted(txid, realTxnid).catch(() => {});
-      await mds(`txndelete id:${txid}`).catch(() => {});
+      // txndelete:true on txnsign already cleaned the custom-txn record on the node.
       return { txnid: realTxnid, raw: post };
     } catch (err) {
       // PENDING is recoverable — preserve everything for resumePendingBuild() to pick up.
@@ -2280,12 +2293,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
       // Lazily set a valid atBlock once the chain becomes visible.
       if (pa.atBlock === 0 && state.chainBlock > 0) pa.atBlock = state.chainBlock;
 
-      // STEP 1 — has the user acted yet? If our txid is still queued in MiniHub,
-      // do nothing. Note: manual Resume bypasses this gate so the user can force
-      // a check if they're sure approvals are done.
+      // STEP 1 — throttle the auto-path. Each MDS write in READ mode queues a separate
+      // approval, so blasting txncheck/txnbasics/txnpost on every NEWBLOCK floods the
+      // user with prompts. Throttle to every `RESUME_THROTTLE_BLOCKS` blocks for auto;
+      // manual Resume always proceeds. (The v1.0.6/v1.0.7 `mds action:pending` gate
+      // was removed — its response shape was unreliable enough to wedge a stuck row.)
       if (!opts.manual) {
-        const stillQueued = await isStillPendingInQueue(pa.txid);
-        if (stillQueued) return;
+        if (state.lastResumeAttemptBlock >= 0 &&
+            state.chainBlock - state.lastResumeAttemptBlock < RESUME_THROTTLE_BLOCKS) {
+          return;
+        }
+        state.lastResumeAttemptBlock = state.chainBlock;
       }
 
       // STEP 2 — verify the txn still exists on the node.
@@ -2293,14 +2311,19 @@ body { padding-top: env(safe-area-inset-top, 0); }
       try {
         chkRes = await mds(`txncheck id:${pa.txid}`);
       } catch (err) {
-        if (err && err.stage === "pending") return;  // txncheck itself queued; wait
+        if (err && err.stage === "pending") {
+          // txncheck itself queued; user has to approve this round. Stay in awaiting.
+          await markHistoryStatus(pa.internalid, "awaiting_approval",
+            "Approve the queued command in MiniHub Pending Actions.").catch(()=>{});
+          if (state.activeTab === "history") loadHistory();
+          return;
+        }
         // Txn not found. Two possibilities:
         //   (a) User denied in MiniHub → txn was never created (or was rolled back).
         //   (b) Earlier steps succeeded, txnpost broadcast, node garbage-collected
         //       the custom-txn record after the broadcast settled.
-        // Both states are "could not confirm" — tell the user to check the explorer.
         await markHistoryStatus(pa.internalid, "could_not_confirm",
-          "Transaction not on node after pending. May have posted and been GC'd, or denied. Check the explorer for the recipient address.").catch(()=>{});
+          "Transaction not on node. May have posted and been GC'd, or denied. Check the explorer for the recipient address.").catch(()=>{});
         state.pendingApproval = null;
         if (state.pendingTxId === pa.txid) state.pendingTxId = null;
         toast("Could not auto-confirm — see History for details.", "warn");
@@ -2308,29 +2331,29 @@ body { padding-top: env(safe-area-inset-top, 0); }
         return;
       }
 
-      // Past the queue gate AND the txn exists — show the user we're working on it.
+      const vChk = (chkRes && chkRes.response && chkRes.response.valid) || {};
+      try { MDS.log("utxoWallet.resume: txncheck basic=" + vChk.basic + " scripts=" + vChk.scripts); } catch {}
+
+      // Past the gates AND the txn exists — show the user we're working on it.
       await markHistoryStatus(pa.internalid, "finalizing", "Approved — completing on-chain post.").catch(()=>{});
       if (state.activeTab === "history") loadHistory();
 
-      // STEP 3 — finalize: basics → check → post → cleanup. Any pending = wait.
-      // Any hard failure leaves the txn for the sweeper (NO txndelete).
+      // STEP 3 — single-shot finalize. txnsign+txnpostauto+txndelete in ONE MDS command,
+      // matching the buildTransaction one-shot design (per docs.minima.global/docs/development/simple-txn).
+      // - If the txn was signed previously and just needs posting, txnsign with auto-post is idempotent
+      //   for the signing step on default wallet addresses (RETURN SIGNEDBY) and proceeds to post.
+      // - If something pends, roll back to awaiting_approval; the user approves once more.
+      // - Hard failure: NO txndelete (orphan waits for the sweeper in WRITE mode).
       try {
-        await mds(`txnbasics id:${pa.txid}`);
-        const chk2 = await mds(`txncheck id:${pa.txid}`);
-        const v2 = (chk2 && chk2.response && chk2.response.valid) || {};
-        if (v2.basic === false || v2.scripts === false) {
-          throw { stage: "txncheck", message: "Post-approval validation failed (basic=" + v2.basic + ", scripts=" + v2.scripts + ")." };
-        }
         const tokenid = pa.context.tokenid;
         const burn = pa.context.burn || "0";
-        const burnParam = (tokenid === "0x00" && isPositive(burn)) ? ` burn:${burn}` : "";
-        const post = await mds(`txnpost id:${pa.txid}${burnParam}`);
+        const burnParam = (tokenid === "0x00" && isPositive(burn)) ? ` txnpostburn:${burn}` : "";
+        const post = await mds(`txnsign id:${pa.txid} publickey:auto txnpostauto:true txndelete:true${burnParam}`);
         const realTxnid =
           (post && post.response && post.response.txpow && post.response.txpow.txpowid) ||
           (post && post.response && post.response.txpowid) ||
           pa.txid;
         await finalizeHistoryPosted(pa.internalid, realTxnid).catch(()=>{});
-        await mds(`txndelete id:${pa.txid}`).catch(()=>{});
         state.pendingApproval = null;
         if (state.pendingTxId === pa.txid) state.pendingTxId = null;
         toast("Approved transaction posted ✓", "success");
@@ -2339,15 +2362,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
         renderSelectionBar();
       } catch (err) {
         if (err && err.stage === "pending") {
-          // Roll the pill back to awaiting_approval so the user knows to act again.
           await markHistoryStatus(pa.internalid, "awaiting_approval",
-            "Another step queued in MiniHub. Approve to continue.").catch(()=>{});
+            "Combined sign+post queued in MiniHub. Approve to complete.").catch(()=>{});
           if (state.activeTab === "history") loadHistory();
-          try { MDS.log("utxoWallet.resume: finalize step queued, will retry next block"); } catch {}
+          try { MDS.log("utxoWallet.resume: combined step queued, will retry next block"); } catch {}
           return;
         }
         try { MDS.log("utxoWallet.resume: hard failure: " + JSON.stringify(err)); } catch {}
-        // Hard failure — mark error but DO NOT txndelete.
         await markHistoryStatus(pa.internalid, "error",
           "Finalize failed: " + ((err && err.message) || (err && err.error) || "unknown")).catch(()=>{});
         state.pendingApproval = null;
@@ -2505,15 +2526,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
     footRow.appendChild(el("span", { text: txid && !txid.startsWith("uw_") ? truncMid(txid, 8, 6) : "tx hash pending…" }));
     const actions = el("div", { class: "history-foot-actions" });
     if (status === "awaiting_approval") {
-      const resumeBtn = el("button", { class: "history-detail-toggle", text: "Resume →" });
-      resumeBtn.title = "Force a finalize attempt now. Use this if you've already approved in MiniHub but the row hasn't progressed.";
+      const resumeBtn = el("button", { class: "history-resume-btn", text: "Resume now" });
+      resumeBtn.title = "Force a finalize attempt now — tap this after approving the latest pending action in MiniHub.";
       resumeBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         resumeBtn.disabled = true;
         resumeBtn.textContent = "Resuming…";
         manualResumeFromRow(row).catch(()=>{}).then(() => {
           resumeBtn.disabled = false;
-          resumeBtn.textContent = "Resume →";
+          resumeBtn.textContent = "Resume now";
         });
       });
       actions.appendChild(resumeBtn);
