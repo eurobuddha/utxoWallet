@@ -1474,7 +1474,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // ─── DB schema + history ───────────────────────────────────────────
   // Schema migration version. Bump alongside any future ALTER step; ensureTable
   // applies only the steps whose version exceeds the last-applied marker.
-  const SCHEMA_VERSION = 2;
+  const SCHEMA_VERSION = 3;
 
   async function getSchemaVersionApplied() {
     return new Promise((resolve) => {
@@ -1519,6 +1519,18 @@ body { padding-top: env(safe-area-inset-top, 0); }
       // tables). Any failure is logged but doesn't block init.
       await sql("ALTER TABLE `history` ALTER COLUMN `status` VARCHAR(32) NOT NULL").catch((e) => {
         try { MDS.log("utxoWallet.ensureTable: status-column migration v2: " + JSON.stringify(e)); } catch {}
+      });
+    }
+    if (applied < 3) {
+      // v3: Retroactive fix for v1.0.14-and-earlier rows wrongly marked
+      // `could_not_confirm`. Pre-v1.0.15, the watcher's 5-minute timeout would
+      // mark `could_not_confirm` when inputs were spent BUT the local TxPoWDB
+      // `customsize` lookup returned 0 (response shape varies; failed silently).
+      // v1.0.15 treats input absence as canonical success — so by definition any
+      // pre-existing could_not_confirm row had its inputs spent at timeout and is
+      // a successful tx. Upgrade them all to confirmed in one shot.
+      await sql("UPDATE `history` SET `status`='confirmed', `note`='Upgraded by v1.0.15 — input absence is the canonical success signal.' WHERE `status`='could_not_confirm'").catch((e) => {
+        try { MDS.log("utxoWallet.ensureTable: could_not_confirm rescue v3: " + JSON.stringify(e)); } catch {}
       });
     }
     if (applied < SCHEMA_VERSION) setSchemaVersionApplied(SCHEMA_VERSION);
@@ -2615,37 +2627,31 @@ body { padding-top: env(safe-area-inset-top, 0); }
       let coinids = [];
       try { coinids = JSON.parse(row.COINIDS || "[]"); } catch {}
 
-      // (a) Orphan recovery for rows whose txnid never got upgraded to a real
-      // txpowid. Three outcomes here:
-      //   - Txn still on node (build still in flight) → leave alone, wait.
-      //   - Txn gone AND inputs spent → strong evidence it posted, promote to
-      //     `confirmed` ("Verified by on-chain input absence").
-      //   - Txn gone AND inputs still present → unusual; fall through to (c)
-      //     timeout so the row eventually settles instead of sitting forever.
-      // The early `continue` ONLY applies to the first two cases — never on the
-      // "fall through to (c)" case.
-      if (txnid && txnid.startsWith("uw_") && ageSecs(ts) > 30) {
-        let tlist;
-        try { tlist = await mds("txnlist"); } catch { tlist = { response: [] }; }
-        const stillOnNode = ((tlist && tlist.response) || []).some(t => t.id === txnid);
-        if (stillOnNode) {
-          // Build still active on the node — don't touch.
-          continue;
-        }
-        const inputsGone = coinids.length > 0 && coinids.every(cid => !state.coins.find(c => c.coinid === cid));
+      // PRIMARY SIGNAL: input absence.
+      // For a row utxoWallet itself built, the input coinids are uniquely tied
+      // to that build. If those coins have disappeared from `coins relevant:true`,
+      // they were spent — which means our tx posted and made it on-chain. Use
+      // this as the canonical success signal, regardless of whether the row has
+      // a real txpowid yet. v1.0.14 and earlier relied on the local TxPoWDB
+      // `history action:customsize` lookup, which silently returned 0 in some
+      // MDS builds and dropped successful txns into the "Issue" bucket.
+      //
+      // The 30-second grace gives MDS time to settle its coin index after the
+      // block lands; otherwise a NEWBLOCK fired BEFORE coins-relevant updates
+      // would briefly look like inputs-still-present.
+      if (ageSecs(ts) > 30 && coinids.length > 0) {
+        const inputsGone = coinids.every(cid => !state.coins.find(c => c.coinid === cid));
         if (inputsGone) {
           await markHistoryStatus(internalid, "confirmed",
-            "Verified by on-chain input absence (real txpowid not captured).").catch(() => {});
-          try { MDS.log("utxoWallet.watcher: promoted " + internalid + " to confirmed via input-absence"); } catch {}
+            "Verified by on-chain input absence.").catch(() => {});
+          try { MDS.log("utxoWallet.watcher: " + internalid + " → confirmed (input-absence)"); } catch {}
           continue;
         }
-        // Txn gone but inputs still present — likely the build never broadcast
-        // (denied / hard failure on node). Let the (c) timeout below decide
-        // between `rejected` and `could_not_confirm` once the 5-minute window
-        // elapses, rather than getting stuck here forever.
       }
 
-      // (b) Positive evidence: TxPoW in local history index AND in a block
+      // BACKUP SIGNAL: real-txpowid lookup against the local TxPoWDB. Useful
+      // when input absence hasn't propagated yet (e.g., right after NEWBLOCK)
+      // and we have a real hash from finalizeHistoryPosted.
       if (txnid && !txnid.startsWith("uw_")) {
         let histRes;
         try {
@@ -2655,20 +2661,18 @@ body { padding-top: env(safe-area-inset-top, 0); }
         const count = parseInt((r && (r.size != null ? r.size : (r.count != null ? r.count : r))) || 0, 10);
         if (count > 0) {
           await markHistoryStatus(internalid, "confirmed").catch(() => {});
+          try { MDS.log("utxoWallet.watcher: " + internalid + " → confirmed (txpowid lookup)"); } catch {}
           continue;
         }
       }
 
-      // (c) Timeout: 5 minutes without evidence
+      // TIMEOUT: 5 minutes elapsed and inputs are still spendable in our wallet.
+      // Strong signal the tx never broadcast (denied, build failed, network
+      // rejected before mining). Mark rejected so the user can Dismiss and move on.
       if (ageSecs(ts) > 5 * 60) {
-        const inputsStillPresent = coinids.some(cid => state.coins.find(c => c.coinid === cid));
-        if (inputsStillPresent) {
-          await markHistoryStatus(internalid, "rejected",
-            "Inputs still spendable after 5 min — tx rejected by miners.").catch(() => {});
-        } else {
-          await markHistoryStatus(internalid, "could_not_confirm",
-            "Inputs spent but tx hash not found in local index.").catch(() => {});
-        }
+        await markHistoryStatus(internalid, "rejected",
+          "Inputs still spendable after 5 min — tx never landed on chain.").catch(() => {});
+        try { MDS.log("utxoWallet.watcher: " + internalid + " → rejected (5-min timeout, inputs still present)"); } catch {}
       }
     }
     // If statuses changed, reflect in History view if it's visible
