@@ -2301,6 +2301,59 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const burnParam = (tokenid === "0x00" && isPositive(burn || "0")) ? ` txnpostburn:${burn}` : "";
     return mds(`txnsign id:${txid} publickey:auto txnpostauto:true txndelete:true${burnParam}`);
   }
+  // Scans the local node's `history` for a recent TxPoW whose outputs include
+  // our recipient with the right amount + tokenid in a timestamp window
+  // starting at the send time. Used as a second-chance mechanism when
+  // `txnsign+txnpostauto:true` doesn't surface a usable txpowid in its
+  // response — so the row can still carry a real on-chain hash that the
+  // explorer's /transactions/<id> route will resolve.
+  //
+  // Response shape verified against minima-global/History v0.2.1's service.js:
+  //   `response.response = { txpows: [...], details: [...] }`, each TxPoW has
+  //   `txpowid`, `header.timemilli`, `body.txn.outputs[]`, `istransaction`.
+  //
+  // Local history beats querying the explorer: zero external dependency, no
+  // privacy leak, faster, and explorer.minima.global's tRPC has no
+  // address-search endpoint anyway (findByAddress / search / etc. all 404).
+  async function findTxpowidByOutput(recipient, amount, tokenid, sentAtMs) {
+    if (!recipient) return null;
+    let histRes;
+    try { histRes = await mds("history relevant:true max:50"); }
+    catch (e) {
+      try { MDS.log("utxoWallet.findTxpowid: history fetch failed: " + JSON.stringify(e)); } catch {}
+      return null;
+    }
+    const txpows = (histRes && histRes.response && histRes.response.txpows) || [];
+    if (!Array.isArray(txpows) || !txpows.length) return null;
+
+    const slackMs = 60 * 1000;
+    const TXPOWID_RE = /^0x[0-9a-fA-F]{64}$/;
+    const wantTokenid = tokenid || "0x00";
+    const wantAmtNorm = normalizeAmount(String(amount));
+
+    for (const tp of txpows) {
+      // Skip block-only TxPoWs — only the transaction-carrying ones have outputs we care about.
+      if (!tp || tp.istransaction !== true) continue;
+      const txpowid = tp.txpowid;
+      if (!txpowid || !TXPOWID_RE.test(txpowid)) continue;
+
+      const tsMs = parseInt((tp.header && tp.header.timemilli) || 0, 10);
+      if (tsMs && sentAtMs && tsMs + slackMs < sentAtMs) continue;
+
+      const outs = (tp.body && tp.body.txn && tp.body.txn.outputs) || [];
+      for (const o of outs) {
+        const oTok = o.tokenid || "0x00";
+        if (oTok !== wantTokenid) continue;
+        if (o.address !== recipient && o.miniaddress !== recipient) continue;
+        const oAmt = String(o.amount != null ? o.amount : (o.tokenamount || ""));
+        if (oAmt !== String(amount) && normalizeAmount(oAmt) !== wantAmtNorm) continue;
+        try { MDS.log("utxoWallet.findTxpowid: matched " + txpowid + " for " + recipient); } catch {}
+        return txpowid;
+      }
+    }
+    return null;
+  }
+
   // Extract the real on-chain txpowid from a txnsign+combined response. The
   // shape varies across MDS builds; we try every known nesting and fall back
   // to the supplied txid (internal `uw_...`) so downstream UPDATEs still run
@@ -2381,12 +2434,24 @@ body { padding-top: env(safe-area-inset-top, 0); }
       // Limit/feedback_minima_tx is specifically about script-address coins, which we
       // never construct.
       stage("sign", "active");
+      const sentAtMs = Date.now();
       const post = await signAndPost(txid, tokenid, burn);
       stage("sign", "done");
       stage("basics", "done");
       stage("check", "done");
       stage("post", "done");
-      const realTxnid = extractRealTxnid(post, txid);
+      let realTxnid = extractRealTxnid(post, txid);
+      // Second-chance lookup: if MDS's response shape didn't surface a valid
+      // 0x-hex txpowid anywhere we know to look, scan local history for the
+      // just-broadcast TxPoW whose outputs match our recipient + amount +
+      // tokenid. The local node almost always has it by the time txnsign
+      // returns. Failing-soft — falls back to uw_ id, watcher tries again
+      // on the next NEWBLOCK pass.
+      if (realTxnid === txid) {
+        const looked = await findTxpowidByOutput(recipient, amount, tokenid, sentAtMs - 5000)
+                              .catch(() => null);
+        if (looked) realTxnid = looked;
+      }
       try {
         // Log the response shape (first 600 chars) so future "missing txpowid"
         // failures are debuggable without a full repro.
@@ -2648,7 +2713,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
   async function watchPendingConfirmations() {
     let rows;
     try {
-      rows = await sql("SELECT internalid, txnid, ts, coinids FROM history WHERE status IN ('posting','posted','finalizing') ORDER BY ts ASC");
+      // Include the recipient/amount/tokenid columns so the txpowid lookup
+      // can match against output records without a second query per row.
+      rows = await sql("SELECT internalid, txnid, ts, coinids, recipient, amount, tokenid FROM history WHERE status IN ('posting','posted','finalizing') ORDER BY ts ASC");
     } catch { return; }
     const ageSecs = (ts) => (Date.now() - parseInt(ts, 10)) / 1000;
 
@@ -2674,9 +2741,27 @@ body { padding-top: env(safe-area-inset-top, 0); }
       if (ageSecs(ts) > 30 && coinids.length > 0) {
         const inputsGone = coinids.every(cid => !state.coins.find(c => c.coinid === cid));
         if (inputsGone) {
-          await markHistoryStatus(internalid, "confirmed",
-            "Verified by on-chain input absence.").catch(() => {});
-          try { MDS.log("utxoWallet.watcher: " + internalid + " → confirmed (input-absence)"); } catch {}
+          // Try to upgrade the row to a real txpowid via local history scan so
+          // the Explorer ↗ link works. If we can't find it, still mark
+          // confirmed (input absence is strong on-chain evidence) but leave
+          // the txnid as the internal `uw_…` — the row will show the Search
+          // recipient ↗ fallback.
+          let upgraded = false;
+          if (txnid && txnid.startsWith("uw_") && row.RECIPIENT) {
+            const looked = await findTxpowidByOutput(
+              row.RECIPIENT, row.AMOUNT, row.TOKENID, parseInt(row.TS, 10) - 5000
+            ).catch(() => null);
+            if (looked) {
+              await finalizeHistoryPosted(internalid, looked).catch(() => {});
+              try { MDS.log("utxoWallet.watcher: " + internalid + " → confirmed with real txpowid via local history"); } catch {}
+              upgraded = true;
+            }
+          }
+          if (!upgraded) {
+            await markHistoryStatus(internalid, "confirmed",
+              "Verified by on-chain input absence.").catch(() => {});
+            try { MDS.log("utxoWallet.watcher: " + internalid + " → confirmed (input-absence, no txpowid located)"); } catch {}
+          }
           continue;
         }
       }
