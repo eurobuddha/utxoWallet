@@ -747,6 +747,22 @@ body { padding-top: env(safe-area-inset-top, 0); }
 }
 .history-resume-btn:hover:not(:disabled) { background: var(--accent2); }
 .history-resume-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.history-copy-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+}
+.history-copy-btn:hover { color: var(--accent); border-color: var(--accent); }
+.history-copy-btn.copied { color: var(--accent); border-color: var(--accent); }
 .history-detail-toggle {
   font-size: 9px;
   color: var(--accent);
@@ -2286,14 +2302,30 @@ body { padding-top: env(safe-area-inset-top, 0); }
     return mds(`txnsign id:${txid} publickey:auto txnpostauto:true txndelete:true${burnParam}`);
   }
   // Extract the real on-chain txpowid from a txnsign+combined response. The
-  // shape varies across MDS builds; we try the known nestings in order and
-  // fall back to the supplied txid (internal `uw_...`) so downstream UPDATEs
-  // still run cleanly.
+  // shape varies across MDS builds; we try every known nesting and fall back
+  // to the supplied txid (internal `uw_...`) so downstream UPDATEs still run
+  // cleanly. Validates the candidate is a 0x-prefixed hex string before
+  // accepting — guards against the response handing us `transactionid` (the
+  // inner-tx hash, which the explorer's /transactions/<id> route doesn't index)
+  // or any other field that happens to live where we look.
   function extractRealTxnid(post, fallbackTxid) {
-    return (post && post.response && post.response.txpow && post.response.txpow.txpowid) ||
-           (post && post.response && post.response.txpowid) ||
-           (post && post.response && post.response.txpowdata && post.response.txpowdata.txpowid) ||
-           fallbackTxid;
+    const r = post && post.response;
+    if (!r) return fallbackTxid;
+    const candidates = [
+      r.txpow && r.txpow.txpowid,
+      r.txpow && r.txpow.id,
+      r.txpowid,
+      r.id,
+      r.txpowdata && r.txpowdata.txpowid,
+      r.txpowdata && r.txpowdata.id,
+      r.txpow && r.txpow.txpow && r.txpow.txpow.txpowid,
+    ];
+    // Real Minima txpowids are `0x` + 64 hex chars (32-byte SHA3 hash).
+    const txpowidRe = /^0x[0-9a-fA-F]{64}$/;
+    for (const c of candidates) {
+      if (typeof c === "string" && txpowidRe.test(c)) return c;
+    }
+    return fallbackTxid;
   }
 
   // ─── buildTransaction ──────────────────────────────────────────────
@@ -2803,6 +2835,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
       });
       a.title = "Open this transaction on explorer.minima.global";
       actions.appendChild(a);
+      // Copy-hash button right next to the link — if the explorer page errors,
+      // user can paste the hash into the explorer's search bar manually.
+      const copyBtn = el("button", { class: "history-copy-btn", text: "Copy hash", type: "button" });
+      copyBtn.title = "Copy the full tx hash so you can paste it into the explorer's search bar.";
+      copyBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        copyToClipboard(txid, copyBtn);
+      });
+      actions.appendChild(copyBtn);
     } else if (recipientAddr &&
                (bucket === "confirmed" || bucket === "broadcasting" || bucket === "issue")) {
       const a = el("a", {
@@ -2810,10 +2851,18 @@ body { padding-top: env(safe-area-inset-top, 0); }
         href: "https://explorer.minima.global/search?q=" + encodeURIComponent(recipientAddr),
         target: "_blank",
         rel: "noopener noreferrer",
-        text: "Verify recipient ↗",
+        text: "Search recipient ↗",
       });
-      a.title = "Search the recipient address on explorer.minima.global (real txpowid unavailable).";
+      a.title = "Open the explorer with the recipient address pre-filled (no on-chain hash captured for this row).";
       actions.appendChild(a);
+      // Also offer to copy the recipient — same backstop logic.
+      const copyBtn = el("button", { class: "history-copy-btn", text: "Copy addr", type: "button" });
+      copyBtn.title = "Copy the recipient address.";
+      copyBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        copyToClipboard(recipientAddr, copyBtn);
+      });
+      actions.appendChild(copyBtn);
     }
 
     // Dismiss button on terminal "issue" rows (error/rejected/expired/could_not_confirm).
