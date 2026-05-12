@@ -698,7 +698,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
   border: 1px solid;
 }
 .status-pill.posting           { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
-.status-pill.awaiting_approval { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); animation: pulse 1.8s ease-in-out infinite; }
+.status-pill.awaiting_approval { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
 .status-pill.posted            { color: var(--blue);   border-color: var(--blue-soft);     background: var(--blue-soft); }
 .status-pill.confirmed         { color: var(--accent); border-color: var(--accent-soft);   background: var(--accent-soft); }
 .status-pill.rejected          { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
@@ -2186,23 +2186,46 @@ body { padding-top: env(safe-area-inset-top, 0); }
     }
   }
 
+  // Returns true if any entry in the MiniHub Pending Actions queue still references
+  // our txid — meaning the user has not yet approved/denied. This is the reliable
+  // signal for "are we still waiting?", replacing the v1.0.5 witness.signatures gate
+  // (which silently broke when the field name varied between MDS builds).
+  async function isStillPendingInQueue(txid) {
+    if (!txid) return false;
+    try {
+      const r = await mds("mds action:pending");
+      const list = (r && r.response) || [];
+      // The pending entry shape varies; serialise the whole entry and substring-search.
+      return list.some(p => {
+        try { return JSON.stringify(p || {}).indexOf(txid) >= 0; }
+        catch { return false; }
+      });
+    } catch {
+      // If we can't read the queue (rare), don't block resume — better to attempt
+      // than to wait forever.
+      return false;
+    }
+  }
+
   // ─── resumePendingBuild ───────────────────────────────────────────
-  // Called from NEWBLOCK handler when state.pendingApproval is set.
-  //
-  // The hard rule (per feedback_pending_resume — v1.0.4 lost a real send to this):
-  //  1. Do NOT touch the txn until the originally-pending step has *actually completed*
-  //     on the node. NEWBLOCK fires within seconds; the user may take minutes to
-  //     approve in MiniHub. Running `txnbasics` / `txncheck` on an unsigned txn would
-  //     return `valid.scripts=false`, the catch would txndelete, and the user's
-  //     subsequently-approved `txnsign` would hit a non-existent txn → "Transaction
-  //     not found" — exactly the v1.0.4 bug.
-  //  2. The resume's hard-failure path MUST NOT `txndelete`. Any orphan txid is left
-  //     for the sweeper to clean once WRITE is granted, eliminating the race.
-  async function resumePendingBuild() {
+  // Called from NEWBLOCK handler when state.pendingApproval is set, AND from a
+  // manual "Resume" button in History (renderHistoryRow). The hard rules
+  // (feedback_pending_resume after v1.0.4/1.0.5 incidents):
+  //  1. Do not touch the txn until our queued command has been processed in MiniHub.
+  //     v1.0.6 uses `mds action:pending` for this — more reliable than inspecting
+  //     witness.signatures (which doesn't exist in every MDS response shape).
+  //  2. The resume's hard-failure path MUST NOT `txndelete`. Orphans wait for the
+  //     sweeper in WRITE mode.
+  //  3. If txncheck reports "not found" we DO NOT mark `rejected` — the txn may
+  //     have already posted and the node may have garbage-collected its custom-txn
+  //     record. Demote to `could_not_confirm` with a note pointing at the explorer.
+  async function resumePendingBuild(opts) {
+    opts = opts || {};
     if (!state.pendingApproval) return;
     const pa = state.pendingApproval;
+    try { MDS.log("utxoWallet.resume: stage=" + pa.stage + " txid=" + pa.txid + " manual=" + (opts.manual === true)); } catch {}
 
-    // Expiry — give up after N blocks. Leave the orphan for the sweeper (no txndelete).
+    // Expiry — leave orphan for sweeper.
     if (state.chainBlock - pa.atBlock > APPROVAL_EXPIRY_BLOCKS) {
       await markHistoryStatus(pa.internalid, "expired",
         `No approval in ${APPROVAL_EXPIRY_BLOCKS} blocks. Switch to WRITE in MiniHub and relaunch to clean up.`).catch(()=>{});
@@ -2213,36 +2236,39 @@ body { padding-top: env(safe-area-inset-top, 0); }
       return;
     }
 
-    // STEP 1 — verify the txn still exists on the node and inspect its witness state.
+    // STEP 1 — has the user acted yet? If our txid is still queued in MiniHub,
+    // do nothing. Note: manual Resume bypasses this gate so the user can force
+    // a check if they're sure approvals are done.
+    if (!opts.manual) {
+      const stillQueued = await isStillPendingInQueue(pa.txid);
+      try { MDS.log("utxoWallet.resume: stillQueued=" + stillQueued); } catch {}
+      if (stillQueued) return;
+    }
+
+    // STEP 2 — verify the txn still exists on the node.
     let chkRes;
     try {
       chkRes = await mds(`txncheck id:${pa.txid}`);
     } catch (err) {
       if (err && err.stage === "pending") return;  // txncheck itself queued; wait
-      // Txn truly missing — user denied, or an earlier-stage approval failed.
-      // Don't txndelete (nothing to delete) — just record the outcome.
-      await markHistoryStatus(pa.internalid, "rejected",
-        "Transaction missing on node after pending — likely denied or removed in MiniHub.").catch(()=>{});
+      // Txn not found. Two possibilities:
+      //   (a) User denied in MiniHub → txn was never created (or was rolled back).
+      //   (b) Earlier steps succeeded, txnpost broadcast, node garbage-collected
+      //       the custom-txn record after the broadcast settled.
+      // Both states are "could not confirm" from our perspective — we don't have a
+      // real txpowid to verify with. Tell the user to check the explorer rather
+      // than assert the tx was rejected.
+      await markHistoryStatus(pa.internalid, "could_not_confirm",
+        "Transaction not on node after pending. May have posted and been GC'd, or denied. Check the explorer for the recipient address.").catch(()=>{});
       state.pendingApproval = null;
       if (state.pendingTxId === pa.txid) state.pendingTxId = null;
-      toast("Transaction was denied or removed in MiniHub. See History.", "error");
+      toast("Could not auto-confirm — see History for details.", "warn");
       renderSelectionBar();
       return;
     }
 
-    // STEP 2 — if we paused at the signing step, wait until a signature is present.
-    // The witness only gains signatures once the user has approved `txnsign` in MiniHub.
-    const witness = (chkRes && chkRes.response && chkRes.response.witness) || {};
-    const sigs    = witness.signatures || [];
-    const hasSig  = Array.isArray(sigs) ? sigs.length > 0 : !!sigs;
-    if (pa.stage === "sign" && !hasSig) {
-      // Approval not processed yet. Wait for the next NEWBLOCK.
-      return;
-    }
-
-    // STEP 3 — try to finalize: basics → check → post → cleanup.
-    // Any pending response along the way means another approval is queued; wait.
-    // Any hard failure leaves the txn in place — sweeper will collect it in WRITE mode.
+    // STEP 3 — finalize: basics → check → post → cleanup. Any pending = wait.
+    // Any hard failure leaves the txn for the sweeper (NO txndelete).
     try {
       await mds(`txnbasics id:${pa.txid}`);
       const chk2 = await mds(`txncheck id:${pa.txid}`);
@@ -2259,8 +2285,6 @@ body { padding-top: env(safe-area-inset-top, 0); }
         (post && post.response && post.response.txpowid) ||
         pa.txid;
       await finalizeHistoryPosted(pa.internalid, realTxnid).catch(()=>{});
-      // Only delete on full success — at this point txnpost has broadcast successfully,
-      // so it's safe to remove the custom-txn record.
       await mds(`txndelete id:${pa.txid}`).catch(()=>{});
       state.pendingApproval = null;
       if (state.pendingTxId === pa.txid) state.pendingTxId = null;
@@ -2269,9 +2293,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
       if (state.activeTab === "history") loadHistory();
       renderSelectionBar();
     } catch (err) {
-      if (err && err.stage === "pending") return;  // another approval queued; wait
-      // Hard failure — mark error but DO NOT txndelete. The sweeper handles orphan
-      // cleanup in WRITE mode. txndelete here could race a still-queued approval.
+      if (err && err.stage === "pending") {
+        try { MDS.log("utxoWallet.resume: finalize step queued, will retry next block"); } catch {}
+        return;  // another approval queued; wait
+      }
+      try { MDS.log("utxoWallet.resume: hard failure: " + JSON.stringify(err)); } catch {}
+      // Hard failure — mark error but DO NOT txndelete.
       await markHistoryStatus(pa.internalid, "error",
         "Finalize failed: " + ((err && err.message) || (err && err.error) || "unknown")).catch(()=>{});
       state.pendingApproval = null;
@@ -2279,6 +2306,29 @@ body { padding-top: env(safe-area-inset-top, 0); }
       toast("Transaction failed after approval — switch to WRITE for cleanup.", "error");
       renderSelectionBar();
     }
+  }
+
+  // Exposed for the manual "Resume" button on awaiting_approval history rows.
+  // Re-attaches state.pendingApproval from the row if it's been lost (dapp restart),
+  // then calls resumePendingBuild with manual:true to bypass the pending-queue gate.
+  async function manualResumeFromRow(row) {
+    if (!row) return;
+    const internalid = row.INTERNALID;
+    const txid = row.TXNID || internalid;
+    let coinids = [];
+    try { coinids = JSON.parse(row.COINIDS || "[]"); } catch {}
+    state.pendingApproval = {
+      internalid, txid, stage: "resume", atBlock: state.chainBlock,
+      context: {
+        recipient: row.RECIPIENT, amount: row.AMOUNT,
+        change: row.CHANGEADDR || "", burn: row.BURN || "0",
+        tokenid: row.TOKENID, changeAmt: "0", coinids,
+      },
+    };
+    state.pendingTxId = txid;
+    toast("Resuming…", "");
+    await resumePendingBuild({ manual: true });
+    loadHistory();
   }
 
   // ─── Watcher ───────────────────────────────────────────────────────
@@ -2381,8 +2431,24 @@ body { padding-top: env(safe-area-inset-top, 0); }
     ));
     const footRow = el("div", { class: "history-foot" });
     footRow.appendChild(el("span", { text: txid && !txid.startsWith("uw_") ? truncMid(txid, 8, 6) : "tx hash pending…" }));
+    const actions = el("div", { style: { display: "flex", gap: "10px", alignItems: "center" } });
+    if (status === "awaiting_approval") {
+      const resumeBtn = el("button", { class: "history-detail-toggle", text: "Resume →" });
+      resumeBtn.title = "Force a finalize attempt now. Use this if you've already approved in MiniHub but the row hasn't progressed.";
+      resumeBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        resumeBtn.disabled = true;
+        resumeBtn.textContent = "Resuming…";
+        manualResumeFromRow(row).catch(()=>{}).then(() => {
+          resumeBtn.disabled = false;
+          resumeBtn.textContent = "Resume →";
+        });
+      });
+      actions.appendChild(resumeBtn);
+    }
     const toggle = el("button", { class: "history-detail-toggle", text: "Details ▾" });
-    footRow.appendChild(toggle);
+    actions.appendChild(toggle);
+    footRow.appendChild(actions);
     card.appendChild(footRow);
 
     let coinids = [];
