@@ -660,7 +660,59 @@ body { padding-top: env(safe-area-inset-top, 0); }
   justify-content: space-between;
   gap: 10px;
 }
-.history-foot-actions { display: flex; gap: 10px; align-items: center; }
+.history-foot-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+/* Explorer link — small inline anchor styled like the other foot actions. */
+.history-explorer-link {
+  font-size: 9px;
+  color: var(--accent);
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  text-decoration: none;
+  padding: 4px 8px;
+  border: 1px solid var(--accent-soft);
+  border-radius: 4px;
+  background: transparent;
+  font-family: inherit;
+  transition: background 0.12s, color 0.12s;
+}
+.history-explorer-link:hover { background: var(--accent-soft); color: var(--accent); }
+
+/* Dismiss button on terminal-state rows (could_not_confirm / error). */
+.history-dismiss-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+}
+.history-dismiss-btn:hover { color: var(--red); border-color: var(--red-border); }
+
+/* "Waiting for confirmation…" sub-text on posted rows. */
+.confirm-pending {
+  font-size: 10px;
+  color: var(--dim);
+  font-style: italic;
+  letter-spacing: 0.3px;
+  margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.confirm-pending::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--blue);
+  animation: pulse 2s ease-in-out infinite;
+}
 
 /* Direction badge: rows are always outgoing for v1.x, but call it out explicitly
    so the user doesn't have to guess. */
@@ -1475,6 +1527,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
     if (!validateTxnId(internalid)) return;
     const noteFrag = note ? `, note='${sqlQuote(note)}'` : "";
     await sql(`UPDATE history SET status='${sqlQuote(status)}'${noteFrag} WHERE internalid='${sqlQuote(internalid)}'`);
+  }
+  // Permanently removes a history row. User-initiated only — used by the
+  // Dismiss button on terminal-state rows (could_not_confirm / error).
+  async function dismissHistoryRow(internalid) {
+    if (!validateTxnId(internalid)) return;
+    await sql(`DELETE FROM history WHERE internalid='${sqlQuote(internalid)}'`);
   }
   async function loadHistory() {
     try {
@@ -2577,11 +2635,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
       el("div", { class: "amt", text: `${formatAmount(amt)} ${tokenLabel(tok)}` }),
     ));
     const footRow = el("div", { class: "history-foot" });
-    footRow.appendChild(el("span", { text: txid && !txid.startsWith("uw_") ? truncMid(txid, 8, 6) : "tx hash pending…" }));
+    const hasRealTxid = txid && !txid.startsWith("uw_");
+    footRow.appendChild(el("span", { text: hasRealTxid ? truncMid(txid, 8, 6) : "tx hash pending…" }));
     const actions = el("div", { class: "history-foot-actions" });
-    // Resume button available on both awaiting_approval AND finalizing rows.
-    // `finalizing` can be a stuck state if the dapp closed mid-resume — the
-    // button lets the user force a fresh attempt.
+
+    // Resume button on awaiting_approval AND finalizing rows. `finalizing` may
+    // be stuck if the dapp closed mid-resume — manual force-retry path.
     if (status === "awaiting_approval" || status === "finalizing") {
       const resumeBtn = el("button", { class: "history-resume-btn", text: "Resume now" });
       resumeBtn.title = "Force a finalize attempt now — tap this after approving the latest pending action in MiniHub.";
@@ -2596,10 +2655,45 @@ body { padding-top: env(safe-area-inset-top, 0); }
       });
       actions.appendChild(resumeBtn);
     }
+
+    // Explorer link — visible whenever we have a real on-chain txpowid.
+    // (For internal-id-only rows, the recipient still gives the user a way to
+    // verify manually — note text already says so.)
+    if (hasRealTxid) {
+      const a = el("a", {
+        class: "history-explorer-link",
+        href: "https://explorer.minima.global/transactions/" + encodeURIComponent(txid),
+        target: "_blank",
+        rel: "noopener noreferrer",
+        text: "Explorer ↗",
+      });
+      a.title = "Open this transaction on explorer.minima.global";
+      actions.appendChild(a);
+    }
+
+    // Dismiss button on terminal-state rows that can't progress further.
+    if (status === "could_not_confirm" || status === "error" || status === "expired" || status === "rejected") {
+      const dismissBtn = el("button", { class: "history-dismiss-btn", text: "Dismiss" });
+      dismissBtn.title = "Permanently remove this row from your history.";
+      dismissBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        dismissBtn.disabled = true;
+        dismissHistoryRow(internalid).catch(()=>{}).then(() => loadHistory());
+      });
+      actions.appendChild(dismissBtn);
+    }
+
     const toggle = el("button", { class: "history-detail-toggle", text: "Details ▾" });
     actions.appendChild(toggle);
     footRow.appendChild(actions);
     card.appendChild(footRow);
+
+    // "Waiting for confirmation…" indicator on posted rows that haven't been
+    // verified on-chain yet. Watcher flips them to `confirmed` on next NEWBLOCK.
+    if (status === "posted") {
+      card.appendChild(el("div", { class: "confirm-pending",
+        text: "Broadcasting — waiting for confirmation on the next block." }));
+    }
 
     let coinids = [];
     try { coinids = JSON.parse(row.COINIDS || "[]"); } catch {}
