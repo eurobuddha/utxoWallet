@@ -2187,37 +2187,68 @@ body { padding-top: env(safe-area-inset-top, 0); }
   }
 
   // ─── resumePendingBuild ───────────────────────────────────────────
-  // Called from NEWBLOCK handler when state.pendingApproval is set. Picks up the
-  // chain from whatever stage paused. txnsign is NEVER retried — once the user
-  // approves in MiniHub, the node's queued command consumes the key-use and the
-  // txn is signed; running txnsign again would burn a second use for no benefit.
-  // We always pick up at txnbasics → txncheck → txnpost.
+  // Called from NEWBLOCK handler when state.pendingApproval is set.
+  //
+  // The hard rule (per feedback_pending_resume — v1.0.4 lost a real send to this):
+  //  1. Do NOT touch the txn until the originally-pending step has *actually completed*
+  //     on the node. NEWBLOCK fires within seconds; the user may take minutes to
+  //     approve in MiniHub. Running `txnbasics` / `txncheck` on an unsigned txn would
+  //     return `valid.scripts=false`, the catch would txndelete, and the user's
+  //     subsequently-approved `txnsign` would hit a non-existent txn → "Transaction
+  //     not found" — exactly the v1.0.4 bug.
+  //  2. The resume's hard-failure path MUST NOT `txndelete`. Any orphan txid is left
+  //     for the sweeper to clean once WRITE is granted, eliminating the race.
   async function resumePendingBuild() {
     if (!state.pendingApproval) return;
     const pa = state.pendingApproval;
 
-    // Expiry guard — if the user never approves, don't sit on the txid forever.
+    // Expiry — give up after N blocks. Leave the orphan for the sweeper (no txndelete).
     if (state.chainBlock - pa.atBlock > APPROVAL_EXPIRY_BLOCKS) {
-      await mds(`txndelete id:${pa.txid}`).catch(()=>{});
       await markHistoryStatus(pa.internalid, "expired",
-        `Approval not received within ${APPROVAL_EXPIRY_BLOCKS} blocks.`).catch(()=>{});
+        `No approval in ${APPROVAL_EXPIRY_BLOCKS} blocks. Switch to WRITE in MiniHub and relaunch to clean up.`).catch(()=>{});
       state.pendingApproval = null;
       if (state.pendingTxId === pa.txid) state.pendingTxId = null;
-      toast("Approval window expired — transaction cancelled.", "warn");
+      toast("Approval window expired. Switch to WRITE for cleanup.", "warn");
       renderSelectionBar();
       return;
     }
 
+    // STEP 1 — verify the txn still exists on the node and inspect its witness state.
+    let chkRes;
     try {
-      // The node may still be queuing earlier stages if the user hasn't approved yet —
-      // each call below will reject with stage:"pending" and we'll wait for the next block.
-      // Pick up from txnbasics onward regardless of which stage originally paused,
-      // because the node executes the approved chain in order.
+      chkRes = await mds(`txncheck id:${pa.txid}`);
+    } catch (err) {
+      if (err && err.stage === "pending") return;  // txncheck itself queued; wait
+      // Txn truly missing — user denied, or an earlier-stage approval failed.
+      // Don't txndelete (nothing to delete) — just record the outcome.
+      await markHistoryStatus(pa.internalid, "rejected",
+        "Transaction missing on node after pending — likely denied or removed in MiniHub.").catch(()=>{});
+      state.pendingApproval = null;
+      if (state.pendingTxId === pa.txid) state.pendingTxId = null;
+      toast("Transaction was denied or removed in MiniHub. See History.", "error");
+      renderSelectionBar();
+      return;
+    }
+
+    // STEP 2 — if we paused at the signing step, wait until a signature is present.
+    // The witness only gains signatures once the user has approved `txnsign` in MiniHub.
+    const witness = (chkRes && chkRes.response && chkRes.response.witness) || {};
+    const sigs    = witness.signatures || [];
+    const hasSig  = Array.isArray(sigs) ? sigs.length > 0 : !!sigs;
+    if (pa.stage === "sign" && !hasSig) {
+      // Approval not processed yet. Wait for the next NEWBLOCK.
+      return;
+    }
+
+    // STEP 3 — try to finalize: basics → check → post → cleanup.
+    // Any pending response along the way means another approval is queued; wait.
+    // Any hard failure leaves the txn in place — sweeper will collect it in WRITE mode.
+    try {
       await mds(`txnbasics id:${pa.txid}`);
-      const chk = await mds(`txncheck id:${pa.txid}`);
-      const v = (chk && chk.response && chk.response.valid) || {};
-      if (v.basic === false || v.scripts === false) {
-        throw { stage: "txncheck", message: "Validation failed after approval (basic=" + v.basic + ", scripts=" + v.scripts + ")." };
+      const chk2 = await mds(`txncheck id:${pa.txid}`);
+      const v2 = (chk2 && chk2.response && chk2.response.valid) || {};
+      if (v2.basic === false || v2.scripts === false) {
+        throw { stage: "txncheck", message: "Post-approval validation failed (basic=" + v2.basic + ", scripts=" + v2.scripts + ")." };
       }
       const tokenid = pa.context.tokenid;
       const burn = pa.context.burn || "0";
@@ -2228,6 +2259,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
         (post && post.response && post.response.txpowid) ||
         pa.txid;
       await finalizeHistoryPosted(pa.internalid, realTxnid).catch(()=>{});
+      // Only delete on full success — at this point txnpost has broadcast successfully,
+      // so it's safe to remove the custom-txn record.
       await mds(`txndelete id:${pa.txid}`).catch(()=>{});
       state.pendingApproval = null;
       if (state.pendingTxId === pa.txid) state.pendingTxId = null;
@@ -2236,17 +2269,14 @@ body { padding-top: env(safe-area-inset-top, 0); }
       if (state.activeTab === "history") loadHistory();
       renderSelectionBar();
     } catch (err) {
-      if (err && err.stage === "pending") {
-        // Still queued — leave state.pendingApproval set; next NEWBLOCK retries.
-        return;
-      }
-      // Hard failure after approval — give up cleanly.
-      await mds(`txndelete id:${pa.txid}`).catch(()=>{});
+      if (err && err.stage === "pending") return;  // another approval queued; wait
+      // Hard failure — mark error but DO NOT txndelete. The sweeper handles orphan
+      // cleanup in WRITE mode. txndelete here could race a still-queued approval.
       await markHistoryStatus(pa.internalid, "error",
-        "Resume failed after approval: " + ((err && err.message) || (err && err.error) || "unknown")).catch(()=>{});
+        "Finalize failed: " + ((err && err.message) || (err && err.error) || "unknown")).catch(()=>{});
       state.pendingApproval = null;
       if (state.pendingTxId === pa.txid) state.pendingTxId = null;
-      toast("Transaction failed after approval — see History.", "error");
+      toast("Transaction failed after approval — switch to WRITE for cleanup.", "error");
       renderSelectionBar();
     }
   }
