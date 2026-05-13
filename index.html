@@ -953,6 +953,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
   color: var(--accent);
 }
 .bal-icon-svg { width: 28px; height: 28px; display: block; }
+.bal-icon-svg.identicon {
+  width: 100%; height: 100%;
+  position: absolute;
+  inset: 0;
+}
+.bal-icon-slot:has(.bal-icon-svg.identicon) {
+  background: transparent;
+  border-color: var(--border);
+}
 .bal-icon-mono {
   font-family: var(--mono);
   font-weight: 700;
@@ -1556,7 +1565,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.25";
+  const UTXOWALLET_VERSION = "1.0.26";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -1734,26 +1743,44 @@ body { padding-top: env(safe-area-inset-top, 0); }
     if (cleaned.length > 2000) return cleaned.slice(0, 2000).trim() + "…";
     return cleaned;
   }
-  // Token-icon resolver. Returns { src } when we can render a real <img>, or
-  // null when the input is junk (ASCII art, plain text, unknown encoding).
-  // Inline SVG goes through base64 → data: URL so scripts in the SVG cannot
-  // execute when loaded via <img>.
+  // Token-icon resolver — matches the canonical Minima wallet shape.
+  //
+  // Per the official webWallet (and confirmed against its production bundle),
+  // tokens carry their icon URL in `c.token.url` and it's URL-encoded. The
+  // wallet runs it through decodeURIComponent before using as <img src>.
+  // The value can be:
+  //   - data:image/* URL (post-decode)
+  //   - http(s):// URL
+  //   - inline <svg>…</svg> markup
+  //   - raw base64 (rare)
+  //
+  // We return { src } for anything plausibly image-shaped and let the browser
+  // do final validation via <img onerror>. Blocking only the obviously-unsafe
+  // schemes (javascript:, vbscript:) keeps us aligned with the official wallet
+  // without inheriting its trust-everything posture.
   function resolveTokenIcon(raw) {
     if (typeof raw !== "string") return null;
-    const trimmed = raw.trim();
+    let trimmed = raw.trim();
     if (!trimmed || trimmed.length > 200000) return null;
-    // 1. data: URL — accept only image types.
-    if (/^data:image\/(png|jpe?g|gif|webp|svg\+xml);/i.test(trimmed)) {
+
+    // The canonical Minima encoding stores `c.token.url` URL-encoded. Try
+    // decoding once; ignore on failure so a non-encoded URL still works.
+    if (/%[0-9A-Fa-f]{2}/.test(trimmed)) {
+      try { trimmed = decodeURIComponent(trimmed).trim(); } catch {}
+    }
+
+    // 1. data: URL — only image types.
+    if (/^data:image\/(png|jpe?g|gif|webp|svg\+xml|x-icon|bmp);/i.test(trimmed)) {
       return { src: trimmed };
     }
-    // 2. http(s):// URL.
+    // 2. http(s):// URL — explicitly block other schemes.
     if (/^https?:\/\//i.test(trimmed)) {
       try { new URL(trimmed); return { src: trimmed }; }
       catch { return null; }
     }
-    // 3. Inline SVG markup → b64-encode as data:image/svg+xml. The browser
-    //    renders SVG-via-img with scripts disabled, so this is safe even when
-    //    the SVG carries embedded <script>.
+    // 3. Inline SVG markup → b64-encode as data:image/svg+xml. SVG loaded via
+    //    <img> has scripts disabled by the browser, so this is safe even when
+    //    the markup embeds <script>.
     if (/^<svg[\s>]/i.test(trimmed) && /<\/svg>\s*$/i.test(trimmed)) {
       try {
         const b64 = btoa(unescape(encodeURIComponent(trimmed)));
@@ -1761,10 +1788,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
       } catch { return null; }
     }
     // 4. Raw base64 (no data: prefix). Must be base64-shaped and a plausible
-    //    image size (≥ 100 chars covers tiny PNGs; ≤ 200kB is our absolute cap).
+    //    image size (≥ 100 chars covers tiny PNGs).
     if (/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed) && trimmed.length >= 100) {
       return { src: `data:image/png;base64,${trimmed}` };
     }
+    // 5. Anything else (plain text, ASCII art, unknown scheme) — drop it and
+    //    let the placeholder / fallback take over.
     return null;
   }
   function truncMid(s, h, t) {
@@ -2489,28 +2518,49 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // calls. Lives in parallel to the Wallet tab so the UTXO-selection
   // mechanics aren't compromised.
   function tokenMetadata(coin) {
-    // Pull raw fields out of the variable Minima shape (c.token.name is
-    // sometimes a string, sometimes a nested object) and HARD-sanitize them
-    // at the boundary. After this function returns, render code can trust
-    // every field to be display-safe and length-bounded.
+    // Schema verified against the official Minima webWallet bundle:
+    //   c.token.url         — icon URL, URL-encoded (decoded by webWallet
+    //                         before passing to <img src>); top-level on
+    //                         c.token, NOT nested under .name
+    //   c.token.name        — string OR { name, description, icon, url }
+    //                         (the nested object form is older / per-token)
+    //   c.token.description — top-level description fallback
+    //   c.token.decimals    — string number, sometimes integer
+    //
+    // Sanitize everything at the boundary so render code can trust the result.
     const tk = (coin && coin.token) || {};
+    const tokenid = String(coin.tokenid || "");
     const nm = tk.name;
-    let rawName = "", rawDesc = "", rawIcon = "", rawUrl = "";
+    let rawName = "", rawDesc = "", rawIcon = "", rawWebsite = "";
+
     if (typeof nm === "string") {
       rawName = nm;
     } else if (nm && typeof nm === "object") {
-      rawName = typeof nm.name === "string" ? nm.name : "";
-      rawDesc = typeof nm.description === "string" ? nm.description : "";
-      rawIcon = typeof nm.icon === "string" ? nm.icon : "";
-      rawUrl  = typeof nm.url === "string" ? nm.url : "";
+      rawName    = typeof nm.name === "string"        ? nm.name        : "";
+      rawDesc    = typeof nm.description === "string" ? nm.description : "";
+      rawIcon    = typeof nm.icon === "string"        ? nm.icon        : "";
+      rawWebsite = typeof nm.url === "string"         ? nm.url         : "";
     }
-    const tokenid = String(coin.tokenid || "");
+    // Top-level description / icon (canonical webWallet shape) — only used
+    // when the nested object form didn't already supply a value.
+    if (!rawDesc && typeof tk.description === "string") rawDesc = tk.description;
+    // The CANONICAL icon location is c.token.url (URL-encoded). Resolver
+    // handles the decode + format probe.
+    const iconSource = (typeof tk.url === "string" && tk.url.length > 0) ? tk.url : rawIcon;
+
+    // For tokens without a real icon URL we draw an inline identicon (see
+    // buildBalanceIcon) — deterministic per tokenid, no network call, no
+    // third-party leak of which tokens this wallet holds. The official
+    // webWallet uses robohash.org for this; we deliberately don't.
+    const icon = resolveTokenIcon(iconSource);
+
     return {
       tokenid,
       name: sanitizeTokenName(rawName, tokenid),
       description: sanitizeDescription(rawDesc),
-      icon: resolveTokenIcon(rawIcon),  // { src } | null
-      url: (typeof rawUrl === "string" && /^https?:\/\//i.test(rawUrl.trim())) ? rawUrl.trim() : "",
+      icon,
+      // Website URL — separate from icon URL. Only linkified when http(s).
+      url: (typeof rawWebsite === "string" && /^https?:\/\//i.test(rawWebsite.trim())) ? rawWebsite.trim() : "",
       decimals: /^[0-9]{1,4}$/.test(String(tk.decimals || "")) ? String(tk.decimals) : "",
     };
   }
@@ -2589,11 +2639,53 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // Build the icon slot. Always 48×48, always a defined visual — either a
   // real image (with hidden fallback to placeholder on load error) or a
   // brand-coloured monogram for tokens with no usable icon data.
+  // Tiny deterministic identicon: 5×5 grid mirrored on the vertical axis,
+  // cell on/off derived from the tokenid's hex bytes, hue derived from the
+  // first two bytes. Same tokenid always yields the same picture. Inline
+  // SVG so it costs zero network and can't leak which tokens this wallet
+  // holds to any third party.
+  function buildIdenticonSVG(tokenid) {
+    const hex = String(tokenid || "").replace(/^0x/i, "").toLowerCase().padEnd(32, "0");
+    const hue   = parseInt(hex.slice(0, 4), 16) % 360;
+    const sat   = 55 + (parseInt(hex.slice(4, 6), 16) % 25);
+    const light = 48 + (parseInt(hex.slice(6, 8), 16) % 10);
+    const fg = `hsl(${hue}, ${sat}%, ${light}%)`;
+    const bg = `hsl(${hue}, ${Math.max(20, sat - 30)}%, 12%)`;
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 48 48");
+    svg.setAttribute("class", "bal-icon-svg identicon");
+    svg.setAttribute("aria-hidden", "true");
+    // background
+    const bgRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    bgRect.setAttribute("width", "48"); bgRect.setAttribute("height", "48"); bgRect.setAttribute("fill", bg);
+    svg.appendChild(bgRect);
+    // 5×5 grid, left 3 columns mirrored to right 2. 8px per cell, 4px outer padding.
+    for (let r = 0; r < 5; r++) {
+      for (let c = 0; c < 3; c++) {
+        const idx = (r * 3 + c + 8) % 32;
+        const bit = parseInt(hex.charAt(idx), 16) & 1;
+        if (!bit) continue;
+        const drawCol = [c, c === 0 ? 4 : (c === 1 ? 3 : 2)];
+        for (const col of new Set(drawCol)) {
+          const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+          rect.setAttribute("x", String(col * 8 + 4));
+          rect.setAttribute("y", String(r * 8 + 4));
+          rect.setAttribute("width", "8");
+          rect.setAttribute("height", "8");
+          rect.setAttribute("fill", fg);
+          svg.appendChild(rect);
+        }
+      }
+    }
+    return svg;
+  }
+
   function buildBalanceIcon(meta, isNative) {
     const slot = el("div", { class: "bal-icon-slot" + (isNative ? " native" : "") });
     if (isNative) {
-      // Built-in Minima glyph — never depends on network or token metadata.
-      // Inline SVG so it stays sharp at any size and matches the lime accent.
+      // Built-in Minima glyph — inline SVG so it stays sharp at any size and
+      // matches the lime accent. No network dependency.
       const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
       svg.setAttribute("viewBox", "0 0 48 48");
       svg.setAttribute("class", "bal-icon-svg");
@@ -2610,11 +2702,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
       slot.appendChild(svg);
       return slot;
     }
-    // Token slot. Always render the monogram placeholder; if we have a
-    // real image, layer it on top — the placeholder serves as the fallback
-    // when the image errors or never loads.
-    const monogram = (meta.name && meta.name.charAt(0) || "?").toUpperCase();
-    slot.appendChild(el("span", { class: "bal-icon-mono", text: monogram }));
+
+    // Token: identicon as the always-present base layer (deterministic from
+    // tokenid, never leaks data). If the token carries a real icon URL, we
+    // layer the <img> on top — on load it covers the identicon; on error the
+    // identicon stays visible. Real graphic wins when available; otherwise
+    // the user still sees something unique and recognisable per token.
+    slot.appendChild(buildIdenticonSVG(meta.tokenid));
     if (meta.icon && meta.icon.src) {
       const img = el("img", { class: "bal-icon-img", alt: "" });
       img.setAttribute("aria-hidden", "true");
