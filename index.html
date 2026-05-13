@@ -1577,7 +1577,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.27";
+  const UTXOWALLET_VERSION = "1.0.28";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -1770,6 +1770,50 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // do final validation via <img onerror>. Blocking only the obviously-unsafe
   // schemes (javascript:, vbscript:) keeps us aligned with the official wallet
   // without inheriting its trust-everything posture.
+  // IPFS gateway URLs (https://ipfs.io/ipns/… and ipfs/…) often can't be set
+  // directly on <img src> — slow gateway response + CORS preflight + redirects
+  // cause silent load failures. The official Minima wallet (2.47.2 bundle's
+  // fetchIPFSImageUri) works around this by fetching the URL, converting the
+  // response to a Blob, and using URL.createObjectURL() instead. We do the
+  // same — once per tokenid, cached in memory for the session.
+  const _tokenIconCache = new Map();   // tokenid → resolved data: or blob: URL
+  const _tokenIconFetches = new Map(); // tokenid → in-flight Promise
+  async function fetchIpfsAsBlob(url) {
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const blob = await resp.blob();
+      return URL.createObjectURL(blob);
+    } catch (e) {
+      try { MDS.log("utxoWallet.ipfs fetch failed: " + url + " — " + String(e)); } catch {}
+      return null;
+    }
+  }
+  // Walks state.coins, kicks off background fetches for any IPFS-hosted token
+  // icons we haven't resolved yet. Cache hit / fetch in-flight → skip. When a
+  // fetch completes successfully we re-render the Balances tab (if visible)
+  // so the new blob URL takes effect.
+  function preResolveTokenIcons() {
+    for (const c of state.coins) {
+      if (!c || !c.token || !c.tokenid || c.tokenid === "0x00") continue;
+      if (typeof c.token.url !== "string" || !c.token.url) continue;
+      if (_tokenIconCache.has(c.tokenid)) continue;
+      if (_tokenIconFetches.has(c.tokenid)) continue;
+
+      let decoded;
+      try { decoded = decodeURIComponent(c.token.url); } catch { decoded = c.token.url; }
+
+      if (decoded.startsWith("https://ipfs.io/ipns/") || decoded.startsWith("https://ipfs.io/ipfs/")) {
+        const job = (async () => {
+          const blob = await fetchIpfsAsBlob(decoded);
+          if (blob) _tokenIconCache.set(c.tokenid, blob);
+          _tokenIconFetches.delete(c.tokenid);
+          if (state.activeTab === "balances") renderBalances();
+        })();
+        _tokenIconFetches.set(c.tokenid, job);
+      }
+    }
+  }
   function resolveTokenIcon(raw) {
     if (typeof raw !== "string") return null;
     let trimmed = raw.trim();
@@ -2310,6 +2354,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
     rebuildGroups();
     renderWallet();
     renderSelectionBar();
+    // Kick off any IPFS icon fetches in the background; they'll trigger a
+    // Balances re-render when they complete (cached for subsequent calls).
+    preResolveTokenIcons();
     if (state.activeTab === "balances") renderBalances();
   }
   function rebuildGroups() {
@@ -2623,11 +2670,18 @@ body { padding-top: env(safe-area-inset-top, 0); }
     // handles the decode + format probe.
     const iconSource = (typeof tk.url === "string" && tk.url.length > 0) ? tk.url : rawIcon;
 
-    // For tokens without a real icon URL we draw an inline identicon (see
-    // buildBalanceIcon) — deterministic per tokenid, no network call, no
-    // third-party leak of which tokens this wallet holds. The official
-    // webWallet uses robohash.org for this; we deliberately don't.
-    const icon = resolveTokenIcon(iconSource);
+    // Resolution order:
+    //   1. Cache hit (IPFS blob URL pre-fetched by preResolveTokenIcons) — wins.
+    //   2. Sync resolver — handles <artimage>, data:image/*, http(s)://, inline SVG, raw base64.
+    //   3. null → caller draws an inline identicon (deterministic per
+    //      tokenid, no network call, no third-party leak).
+    let icon = null;
+    const cached = _tokenIconCache.get(tokenid);
+    if (cached) {
+      icon = { src: cached };
+    } else {
+      icon = resolveTokenIcon(iconSource);
+    }
 
     return {
       tokenid,
