@@ -679,6 +679,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
   white-space: nowrap;
 }
 .row-amount .tok { font-size: 11px; color: var(--accent); margin-left: 4px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.2px; }
+.amt-num.truncated {
+  cursor: copy;
+  text-decoration: underline dotted var(--dim);
+  text-underline-offset: 3px;
+}
+.amt-num.truncated:hover { text-decoration-color: var(--accent); }
+.amt-num.copied { color: var(--accent); }
 .row-arrow { color: var(--dim); font-size: 14px; }
 .row-recipient {
   font-family: var(--mono);
@@ -902,6 +909,137 @@ body { padding-top: env(safe-area-inset-top, 0); }
 }
 .history-resume-btn:hover:not(:disabled) { background: var(--accent2); }
 .history-resume-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Balances tab ── */
+.balance-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+}
+.balance-card.native {
+  border-color: var(--accent-soft);
+  background: linear-gradient(180deg, var(--surface) 0%, var(--surface2) 100%);
+}
+.balance-head {
+  display: grid;
+  grid-template-columns: 38px 1fr auto;
+  gap: 12px;
+  align-items: center;
+}
+.balance-icon {
+  width: 38px; height: 38px;
+  border-radius: 8px;
+  object-fit: cover;
+  background: var(--surface3);
+  border: 1px solid var(--border);
+}
+.balance-icon.placeholder {
+  display: flex; align-items: center; justify-content: center;
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 18px;
+  font-family: var(--mono);
+}
+.balance-card.native .balance-icon.placeholder {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.balance-title {
+  min-width: 0;
+}
+.balance-symbol {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--heading);
+}
+.balance-name {
+  font-size: 11px;
+  color: var(--dim);
+  margin-top: 2px;
+}
+.balance-amount {
+  text-align: right;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--heading);
+  white-space: nowrap;
+}
+.balance-card.native .balance-amount { color: var(--accent); }
+.balance-suffix {
+  font-size: 10px;
+  color: var(--dim);
+  margin-left: 6px;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.balance-sub {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--dim);
+}
+.balance-utxo-count { font-variant-numeric: tabular-nums; }
+.balance-desc {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.5;
+  word-break: break-word;
+}
+.balance-meta {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.balance-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+}
+.balance-meta-label {
+  font-size: 9px;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: var(--dim);
+  min-width: 64px;
+  font-weight: 600;
+}
+.balance-meta-value {
+  color: var(--text);
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-all;
+}
+.balance-meta-value.mono { font-family: var(--mono); font-size: 11px; }
+.balance-meta-link {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-decoration: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-all;
+}
+.balance-meta-link:hover { text-decoration: underline; }
+.balances-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--dim);
+  font-size: 12px;
+}
 
 .history-copy-btn {
   background: transparent;
@@ -1146,6 +1284,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 <div class="wrap">
   <div class="tabs" role="tablist">
     <button class="tab active" data-tab="wallet">Wallet</button>
+    <button class="tab" data-tab="balances">Balances</button>
     <button class="tab" data-tab="history">History</button>
     <button class="tab" data-tab="settings">⚙</button>
   </div>
@@ -1163,6 +1302,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
       </div>
     </div>
     <div id="walletBody"><!-- populated by renderWallet() --></div>
+  </section>
+
+  <!-- Balances tab -->
+  <section id="tab-balances" style="display:none">
+    <div id="balancesBody"><!-- populated by renderBalances() --></div>
   </section>
 
   <!-- History tab -->
@@ -1323,7 +1467,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.23";
+  const UTXOWALLET_VERSION = "1.0.24";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -1504,6 +1648,31 @@ body { padding-top: env(safe-area-inset-top, 0); }
       truncated: true,
     };
   }
+  // Wraps a compactAmount result in a span. If the display was truncated:
+  // adds a `truncated` CSS class (dotted underline + copy cursor), a hover
+  // tooltip showing the exact value, and a dblclick handler that copies the
+  // exact value to the clipboard. The `suffix` (token label etc.) is
+  // appended OUTSIDE the truncated span so double-clicking the number copies
+  // just the number, not the token label.
+  function compactAmountSpan(raw, maxDecimals, opts) {
+    opts = opts || {};
+    const c = compactAmount(raw, maxDecimals);
+    const numSpan = el("span", { class: "amt-num" + (c.truncated ? " truncated" : ""), text: c.display });
+    if (c.truncated) {
+      const fullPretty = formatAmount(c.full);
+      numSpan.title = `Exact: ${fullPretty}${opts.suffix ? " " + opts.suffix : ""} — double-click to copy`;
+      numSpan.setAttribute("data-no-swap", "");
+      numSpan.addEventListener("dblclick", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        // Suppress accidental browser selection of the partial display.
+        try { window.getSelection && window.getSelection().removeAllRanges(); } catch {}
+        copyToClipboard(c.full, numSpan);
+        toast(`Copied exact amount: ${fullPretty}`, "");
+      });
+    }
+    return numSpan;
+  }
   function el(tag, props, ...kids) {
     const e = document.createElement(tag);
     if (props) {
@@ -1534,12 +1703,18 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const fn = () => {
       if (anchorBtn) {
         anchorBtn.classList.add("copied");
-        const orig = anchorBtn.textContent;
-        anchorBtn.textContent = "copied";
-        setTimeout(() => {
-          anchorBtn.classList.remove("copied");
-          anchorBtn.textContent = orig;
-        }, 1400);
+        // Buttons get their label swapped to "copied"; inline amount spans
+        // opt out via data-no-swap so the visible number isn't replaced mid-row.
+        if (!anchorBtn.hasAttribute("data-no-swap")) {
+          const orig = anchorBtn.textContent;
+          anchorBtn.textContent = "copied";
+          setTimeout(() => {
+            anchorBtn.classList.remove("copied");
+            anchorBtn.textContent = orig;
+          }, 1400);
+        } else {
+          setTimeout(() => anchorBtn.classList.remove("copied"), 1400);
+        }
       }
     };
     try {
@@ -1883,6 +2058,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     rebuildGroups();
     renderWallet();
     renderSelectionBar();
+    if (state.activeTab === "balances") renderBalances();
   }
   function rebuildGroups() {
     state.groups = new Map();
@@ -1995,7 +2171,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const metaRow = el("div", { class: "card-meta-row" });
     let appended = false;
     if (isPositive(g.totalMinima)) {
-      metaRow.appendChild(el("span", { class: "amt", text: formatAmount(g.totalMinima) }));
+      metaRow.appendChild(el("span", { class: "amt" }, compactAmountSpan(g.totalMinima, 8, { suffix: "MINIMA" })));
       metaRow.appendChild(document.createTextNode(" MINIMA"));
       appended = true;
     }
@@ -2063,7 +2239,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       onToggleUTXO(c.coinid);
     });
 
-    const amtEl = el("div", { class: "utxo-amt", text: formatAmount(coinAmt(c)) });
+    const amtEl = el("div", { class: "utxo-amt" }, compactAmountSpan(coinAmt(c), 8, { suffix: tokenLabel(tokenid) }));
 
     // Coinid: last 8 chars only, full id in title tooltip — UX address is the card header
     const idShort = "…" + c.coinid.slice(-8);
@@ -2140,15 +2316,201 @@ body { padding-top: env(safe-area-inset-top, 0); }
       sb.classList.add("has-selection");
       cnt.textContent = `${n} coin${n > 1 ? "s" : ""} selected`;
       const total = selectedTotal();
-      const lab = el("span", null);
-      lab.appendChild(document.createTextNode(formatAmount(total)));
-      lab.appendChild(el("span", { class: "tok", text: tokenLabel(state.selectedTokenid || "0x00") }));
+      const tokLab = tokenLabel(state.selectedTokenid || "0x00");
+      const lab = el("span", null,
+        compactAmountSpan(total, 8, { suffix: tokLab }),
+        el("span", { class: "tok", text: tokLab }),
+      );
       clearNode(tot);
       tot.appendChild(lab);
     }
     clearBtn.disabled = n === 0;
     sendBtn.disabled  = n === 0 || !state.settings.writeConfirmed || state.pendingTxId !== null;
     sendBtn.title = !state.settings.writeConfirmed ? "Grant WRITE permission in Settings first." : "";
+  }
+
+  // ─── Balances tab ──────────────────────────────────────────────────
+  // Traditional "this is your wallet" view. The Wallet tab is for picking
+  // specific UTXOs to spend; Balances is for "how much do I have, and what
+  // tokens am I holding." Same data source (state.coins) — no extra MDS
+  // calls. Lives in parallel to the Wallet tab so the UTXO-selection
+  // mechanics aren't compromised.
+  function tokenMetadata(coin) {
+    // Minima's `c.token.name` is sometimes a plain string, sometimes a
+    // structured object with nested name/description/icon/url. Defensively
+    // peel through both shapes.
+    const tk = (coin && coin.token) || {};
+    const nm = tk.name;
+    let name = "", description = "", icon = "", url = "";
+    if (typeof nm === "string") {
+      name = nm;
+    } else if (nm && typeof nm === "object") {
+      name = String(nm.name || "");
+      description = String(nm.description || "");
+      icon = String(nm.icon || "");
+      url = String(nm.url || "");
+    }
+    return {
+      tokenid: String(coin.tokenid || ""),
+      name: name,
+      description: description,
+      icon: icon,
+      url: url,
+      decimals: String(tk.decimals || ""),
+      totalSupply: String(tk.totalamount || tk.total || ""),
+    };
+  }
+  function aggregateBalances() {
+    // Returns { minima: { total, count }, tokens: Map<tokenid, { meta, total, count }> }
+    const tokens = new Map();
+    let minimaTotal = "0";
+    let minimaCount = 0;
+    for (const c of state.coins) {
+      if (c.tokenid === "0x00") {
+        minimaTotal = bigAdd(minimaTotal, String(c.amount || "0"));
+        minimaCount++;
+      } else {
+        const existing = tokens.get(c.tokenid);
+        if (existing) {
+          existing.total = bigAdd(existing.total, String(c.tokenamount || "0"));
+          existing.count++;
+        } else {
+          tokens.set(c.tokenid, {
+            meta: tokenMetadata(c),
+            total: String(c.tokenamount || "0"),
+            count: 1,
+          });
+        }
+      }
+    }
+    return { minima: { total: minimaTotal, count: minimaCount }, tokens };
+  }
+  function renderBalances() {
+    const body = document.getElementById("balancesBody");
+    if (!body) return;
+    clearNode(body);
+
+    if (!state.coins.length) {
+      body.appendChild(renderEmptyWallet());
+      return;
+    }
+
+    const agg = aggregateBalances();
+
+    // Minima total card — prominent, always present (even if zero).
+    body.appendChild(renderBalanceCard({
+      symbol: "MINIMA",
+      meta: { name: "Minima", tokenid: "0x00", description: "", icon: "", url: "", decimals: "44", totalSupply: "" },
+      total: agg.minima.total,
+      count: agg.minima.count,
+      isNative: true,
+    }));
+
+    // Token cards — sorted by total desc.
+    const tokens = [...agg.tokens.values()].sort((a, b) =>
+      bigGt(a.total, b.total) ? -1 : 1
+    );
+    if (!tokens.length && !isPositive(agg.minima.total)) {
+      body.appendChild(el("div", { class: "balances-empty", text: "No spendable balances yet." }));
+      return;
+    }
+    for (const t of tokens) {
+      body.appendChild(renderBalanceCard({
+        symbol: t.meta.name || truncMid(t.meta.tokenid, 4, 4),
+        meta: t.meta,
+        total: t.total,
+        count: t.count,
+        isNative: false,
+      }));
+    }
+  }
+  function renderBalanceCard({ symbol, meta, total, count, isNative }) {
+    const card = el("div", { class: "balance-card" + (isNative ? " native" : "") });
+
+    // Header — icon, symbol, total
+    const head = el("div", { class: "balance-head" });
+    if (meta.icon) {
+      const img = el("img", { class: "balance-icon", alt: "", "aria-hidden": "true" });
+      // Set src after creating so an invalid URL fails quietly (img hides itself).
+      img.src = meta.icon;
+      img.onerror = () => { img.style.display = "none"; };
+      head.appendChild(img);
+    } else {
+      head.appendChild(el("div", { class: "balance-icon placeholder", text: (symbol || "·").charAt(0).toUpperCase() }));
+    }
+    const titleWrap = el("div", { class: "balance-title" },
+      el("div", { class: "balance-symbol", text: symbol }),
+      meta.name && meta.name !== symbol
+        ? el("div", { class: "balance-name", text: meta.name })
+        : null,
+    );
+    head.appendChild(titleWrap);
+
+    const amountWrap = el("div", { class: "balance-amount" },
+      compactAmountSpan(total, 8, { suffix: symbol }),
+      el("span", { class: "balance-suffix", text: symbol }),
+    );
+    head.appendChild(amountWrap);
+    card.appendChild(head);
+
+    // Sub-line: UTXO count.
+    card.appendChild(el("div", { class: "balance-sub" },
+      el("span", { class: "balance-utxo-count",
+        text: count + " coin" + (count === 1 ? "" : "s") }),
+    ));
+
+    // Description (collapsed inline; many tokens carry useful info here).
+    if (meta.description) {
+      card.appendChild(el("div", { class: "balance-desc", text: meta.description }));
+    }
+
+    // Details — tokenid, URL, decimals. Native Minima skips these (everyone
+    // knows what MINIMA is).
+    if (!isNative) {
+      const meta_rows = el("div", { class: "balance-meta" });
+
+      // Token ID with truncation + copy
+      const idRow = el("div", { class: "balance-meta-row" });
+      idRow.appendChild(el("span", { class: "balance-meta-label", text: "TokenID" }));
+      idRow.appendChild(el("span", { class: "balance-meta-value mono", text: truncMid(meta.tokenid, 8, 6), title: meta.tokenid }));
+      idRow.appendChild(copyButton(meta.tokenid, "Copy"));
+      meta_rows.appendChild(idRow);
+
+      // Decimals
+      if (meta.decimals) {
+        const decRow = el("div", { class: "balance-meta-row" });
+        decRow.appendChild(el("span", { class: "balance-meta-label", text: "Decimals" }));
+        decRow.appendChild(el("span", { class: "balance-meta-value", text: meta.decimals }));
+        meta_rows.appendChild(decRow);
+      }
+
+      // URL — only allow http(s) so we never construct a javascript: link from
+      // attacker-controlled token metadata.
+      if (meta.url && /^https?:\/\//i.test(meta.url)) {
+        const urlRow = el("div", { class: "balance-meta-row" });
+        urlRow.appendChild(el("span", { class: "balance-meta-label", text: "URL" }));
+        const link = el("a", {
+          class: "balance-meta-link",
+          href: meta.url,
+          target: "_blank",
+          rel: "noopener noreferrer",
+          text: truncMid(meta.url, 24, 16),
+          title: meta.url,
+        });
+        urlRow.appendChild(link);
+        meta_rows.appendChild(urlRow);
+      } else if (meta.url) {
+        // Non-http URL: render text only, no clickable link.
+        const urlRow = el("div", { class: "balance-meta-row" });
+        urlRow.appendChild(el("span", { class: "balance-meta-label", text: "URL" }));
+        urlRow.appendChild(el("span", { class: "balance-meta-value", text: meta.url }));
+        meta_rows.appendChild(urlRow);
+      }
+
+      card.appendChild(meta_rows);
+    }
+
+    return card;
   }
 
   // ─── Tab switching ─────────────────────────────────────────────────
@@ -2158,8 +2520,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
       t.classList.toggle("active", t.dataset.tab === name);
     }
     document.getElementById("tab-wallet").style.display   = name === "wallet"   ? "" : "none";
+    document.getElementById("tab-balances").style.display = name === "balances" ? "" : "none";
     document.getElementById("tab-history").style.display  = name === "history"  ? "" : "none";
     document.getElementById("tab-settings").style.display = name === "settings" ? "" : "none";
+    if (name === "balances") renderBalances();
     if (name === "history") loadHistory();
     if (name === "settings") renderSettings();
   }
@@ -3114,7 +3478,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const display = truncMid(fullAddr, 12, 10);
     const val = el("span", { class: "kv-mono", text: display, title: fullAddr });
     wrap.appendChild(val);
-    if (opts.amount) {
+    // Two ways to render the trailing amount:
+    //   - opts.amountRaw  → wrapped in compactAmountSpan (truncation + dblclick-copy)
+    //   - opts.amount     → plain string (legacy callers / no truncation needed)
+    if (opts.amountRaw != null && opts.amountRaw !== "") {
+      const amtWrap = el("span", { class: "kv-amount" });
+      amtWrap.appendChild(compactAmountSpan(opts.amountRaw, opts.maxDecimals || 8, { suffix: opts.amountSuffix || "" }));
+      if (opts.amountSuffix) {
+        amtWrap.appendChild(document.createTextNode(" " + opts.amountSuffix));
+      }
+      wrap.appendChild(amtWrap);
+    } else if (opts.amount) {
       const amtEl = el("span", { class: "kv-amount", text: opts.amount });
       if (opts.amountTitle) amtEl.title = opts.amountTitle;
       wrap.appendChild(amtEl);
@@ -3185,14 +3559,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
       copyButton(recipientAddr, "Copy"),
     );
     // MiniNumber arithmetic produces up to 44 decimal places — display-truncate
-    // to 8 so the summary line doesn't overflow the row. The exact amount lives
-    // on the hover tooltip and in the FROM/CHANGE detail rows.
-    const compactAmt = compactAmount(amt, 8);
-    const amountSpan = el("span", {
-      class: "row-amount",
-      title: compactAmt.truncated ? `Exact amount: ${formatAmount(compactAmt.full)} ${tokenLabel(tok)}` : "",
-    },
-      document.createTextNode(compactAmt.display),
+    // to 8 so the summary line doesn't overflow the row. Double-click the
+    // truncated number to copy the exact value.
+    const amountSpan = el("span", { class: "row-amount" },
+      compactAmountSpan(amt, 8, { suffix: tokenLabel(tok) }),
       el("span", { class: "tok", text: tokenLabel(tok) }),
     );
     card.appendChild(el("div", { class: "row-summary" },
@@ -3231,14 +3601,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
         const inAmtRaw = isToken
           ? (inp.tokenamount != null ? inp.tokenamount : inp.amount)
           : inp.amount;
-        let inAmtStr = "";
-        let inAmtTitle = "";
-        if (inAmtRaw != null && inAmtRaw !== "") {
-          const c = compactAmount(String(inAmtRaw), 8);
-          inAmtStr = c.display;
-          if (c.truncated) inAmtTitle = `Exact: ${formatAmount(c.full)}`;
-        }
-        list.appendChild(addressLine(addr, { amount: inAmtStr, amountTitle: inAmtTitle }));
+        list.appendChild(addressLine(addr, { amountRaw: inAmtRaw != null ? String(inAmtRaw) : "" }));
       }
       fromSection.appendChild(list);
     } else {
@@ -3278,9 +3641,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
     if (burn && burn !== "0" && burn !== "0.0") {
       const burnSection = el("div", { class: "kv-section" });
       burnSection.appendChild(el("div", { class: "kv-label", text: "BURN" }));
-      const burnC = compactAmount(burn, 8);
-      const burnAmt = el("span", { class: "kv-amount", text: `${burnC.display} MINIMA` });
-      if (burnC.truncated) burnAmt.title = `Exact: ${formatAmount(burnC.full)} MINIMA`;
+      const burnAmt = el("span", { class: "kv-amount" },
+        compactAmountSpan(burn, 8, { suffix: "MINIMA" }),
+        document.createTextNode(" MINIMA"),
+      );
       burnSection.appendChild(el("div", { class: "kv-row" }, burnAmt));
       details.appendChild(burnSection);
     }
