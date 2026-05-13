@@ -911,134 +911,223 @@ body { padding-top: env(safe-area-inset-top, 0); }
 .history-resume-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Balances tab ── */
-.balance-card {
+.bal-card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 14px 16px;
-  margin-bottom: 10px;
+  border-radius: 10px;
+  padding: 16px 18px;
+  margin-bottom: 12px;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
-.balance-card.native {
-  border-color: var(--accent-soft);
-  background: linear-gradient(180deg, var(--surface) 0%, var(--surface2) 100%);
+.bal-card:hover { border-color: var(--border2, var(--border)); }
+.bal-card.native {
+  border-color: rgba(128, 230, 0, 0.32);
+  background:
+    radial-gradient(120% 80% at 0% 0%, rgba(128, 230, 0, 0.08) 0%, rgba(128, 230, 0, 0) 60%),
+    linear-gradient(180deg, var(--surface) 0%, var(--surface2) 100%);
+  box-shadow: 0 0 0 1px rgba(128, 230, 0, 0.06) inset;
 }
-.balance-head {
+.bal-top {
   display: grid;
-  grid-template-columns: 38px 1fr auto;
-  gap: 12px;
+  grid-template-columns: 48px minmax(0, 1fr) auto;
+  gap: 14px;
   align-items: center;
 }
-.balance-icon {
-  width: 38px; height: 38px;
-  border-radius: 8px;
-  object-fit: cover;
+/* Icon slot — always 48×48, never grows, never reveals raw metadata text */
+.bal-icon-slot {
+  position: relative;
+  width: 48px; height: 48px;
+  border-radius: 10px;
   background: var(--surface3);
   border: 1px solid var(--border);
-}
-.balance-icon.placeholder {
-  display: flex; align-items: center; justify-content: center;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 48px;
   color: var(--accent);
-  font-weight: 700;
-  font-size: 18px;
+}
+.bal-icon-slot.native {
+  background: linear-gradient(140deg, rgba(128, 230, 0, 0.18) 0%, rgba(128, 230, 0, 0.04) 100%);
+  border-color: rgba(128, 230, 0, 0.45);
+  color: var(--accent);
+}
+.bal-icon-svg { width: 28px; height: 28px; display: block; }
+.bal-icon-mono {
   font-family: var(--mono);
-}
-.balance-card.native .balance-icon.placeholder {
-  background: var(--accent-soft);
-  border-color: var(--accent);
+  font-weight: 700;
+  font-size: 20px;
+  letter-spacing: -0.5px;
   color: var(--accent);
+  text-transform: uppercase;
+  user-select: none;
 }
-.balance-title {
+.bal-icon-img {
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  background: var(--surface3);
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.bal-icon-img.loaded { opacity: 1; }
+
+.bal-ident {
   min-width: 0;
 }
-.balance-symbol {
-  font-size: 13px;
+.bal-symbol {
+  font-size: 14px;
   font-weight: 700;
   letter-spacing: 1.5px;
   text-transform: uppercase;
   color: var(--heading);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
-.balance-name {
-  font-size: 11px;
+.bal-name {
+  font-size: 11.5px;
   color: var(--dim);
-  margin-top: 2px;
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
-.balance-amount {
+.bal-amount-wrap {
   text-align: right;
+  min-width: 0;
+}
+.bal-amount {
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
-  font-size: 17px;
+  font-size: 18px;
   font-weight: 700;
   color: var(--heading);
+  line-height: 1.1;
   white-space: nowrap;
 }
-.balance-card.native .balance-amount { color: var(--accent); }
-.balance-suffix {
-  font-size: 10px;
+.bal-card.native .bal-amount { color: var(--accent); }
+.bal-count {
+  font-size: 10.5px;
   color: var(--dim);
-  margin-left: 6px;
+  margin-top: 4px;
+  letter-spacing: 0.4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bal-desc-block {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+.bal-desc {
+  font-size: 12.5px;
+  color: var(--text);
+  line-height: 1.55;
+  word-break: break-word;
+  white-space: pre-wrap;  /* preserve legitimate newlines */
+}
+.bal-desc.clamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.bal-desc-toggle {
+  margin-top: 6px;
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 10.5px;
   letter-spacing: 1.2px;
   text-transform: uppercase;
-  font-weight: 600;
+  padding: 2px 0;
 }
-.balance-sub {
-  margin-top: 8px;
-  font-size: 11px;
-  color: var(--dim);
-}
-.balance-utxo-count { font-variant-numeric: tabular-nums; }
-.balance-desc {
-  margin-top: 10px;
-  padding-top: 10px;
+.bal-desc-toggle:hover { color: var(--accent2, var(--accent)); }
+
+.bal-details {
+  margin-top: 12px;
+  padding-top: 12px;
   border-top: 1px dashed var(--border);
-  font-size: 12px;
-  color: var(--text);
-  line-height: 1.5;
-  word-break: break-word;
 }
-.balance-meta {
-  margin-top: 10px;
-  padding-top: 10px;
-  border-top: 1px dashed var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-.balance-meta-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 11.5px;
-}
-.balance-meta-label {
-  font-size: 9px;
+.bal-details-summary {
+  font-size: 10.5px;
   letter-spacing: 1.4px;
   text-transform: uppercase;
   color: var(--dim);
-  min-width: 64px;
+  cursor: pointer;
   font-weight: 600;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  outline: none;
+  padding: 2px 0;
 }
-.balance-meta-value {
+.bal-details-summary::-webkit-details-marker { display: none; }
+.bal-details-summary::before {
+  content: "▸";
+  font-size: 10px;
+  color: var(--dim);
+  transition: transform 0.15s;
+  display: inline-block;
+}
+.bal-details[open] .bal-details-summary::before { transform: rotate(90deg); }
+.bal-details-summary:hover { color: var(--accent); }
+
+.bal-detail-grid {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 14px;
+  align-items: center;
+}
+.bal-detail-label {
+  font-size: 9.5px;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  color: var(--dim);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.bal-detail-value {
+  font-size: 11.5px;
   color: var(--text);
-  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
   word-break: break-all;
 }
-.balance-meta-value.mono { font-family: var(--mono); font-size: 11px; }
-.balance-meta-link {
+.bal-mono {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.bal-link {
   color: var(--accent);
   font-family: var(--mono);
   font-size: 11px;
   text-decoration: none;
-  flex: 1 1 auto;
-  min-width: 0;
   word-break: break-all;
 }
-.balance-meta-link:hover { text-decoration: underline; }
+.bal-link:hover { text-decoration: underline; }
+
 .balances-empty {
-  padding: 24px;
+  padding: 36px 24px;
   text-align: center;
   color: var(--dim);
-  font-size: 12px;
+  font-size: 12.5px;
+}
+.balances-empty-glyph {
+  font-size: 32px;
+  color: var(--dim);
+  margin-bottom: 8px;
+  user-select: none;
 }
 
 .history-copy-btn {
@@ -1467,7 +1556,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.24";
+  const UTXOWALLET_VERSION = "1.0.25";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -1616,6 +1705,67 @@ body { padding-top: env(safe-area-inset-top, 0); }
   function tokenLabel(tokenid) {
     if (tokenid === "0x00") return "MINIMA";
     return TOKEN_NAMES.get(tokenid) || truncMid(tokenid, 4, 4);
+  }
+  // ── Token metadata sanitizers ─────────────────────────────────────
+  // Minima tokens can carry arbitrary user-uploaded data in their `name`
+  // object (name / description / icon / url). Without bounds, a single
+  // malformed token can dump pages of ASCII garbage into the UI. Sanitize
+  // everything at the boundary so render code can trust its inputs.
+  function sanitizeTokenName(raw, tokenid) {
+    if (typeof raw !== "string") return truncMid(String(tokenid || ""), 4, 4);
+    // Strip C0 control chars (\x00-\x1F), DEL (\x7F), zero-width / direction-
+    // mark chars (U+200B-U+200F), and BOM (U+FEFF). Spaces are preserved so
+    // legitimate names like "Tether USDT" survive intact.
+    const cleaned = raw.replace(/[\x00-\x1F\x7F​-‏﻿]/g, "").trim();
+    if (!cleaned) return truncMid(String(tokenid || ""), 4, 4);
+    // Cap at 32 visible chars. Any token name longer than that is unreasonable
+    // and almost always indicates ASCII art / spam in the name field.
+    if (cleaned.length > 32) return cleaned.slice(0, 30).trim() + "…";
+    return cleaned;
+  }
+  function sanitizeDescription(raw) {
+    if (typeof raw !== "string") return "";
+    // Strip C0 control chars EXCEPT newline (\x0A) and tab (\x09), DEL,
+    // zero-width / direction-mark chars, and BOM. Preserve normal whitespace
+    // so legitimate prose with paragraph breaks renders correctly.
+    const cleaned = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F​-‏﻿]/g, "").trim();
+    // Hard cap so a runaway description can't blow up the layout even when
+    // expanded. 2000 chars ~= 400 words; plenty for legitimate token info.
+    if (cleaned.length > 2000) return cleaned.slice(0, 2000).trim() + "…";
+    return cleaned;
+  }
+  // Token-icon resolver. Returns { src } when we can render a real <img>, or
+  // null when the input is junk (ASCII art, plain text, unknown encoding).
+  // Inline SVG goes through base64 → data: URL so scripts in the SVG cannot
+  // execute when loaded via <img>.
+  function resolveTokenIcon(raw) {
+    if (typeof raw !== "string") return null;
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.length > 200000) return null;
+    // 1. data: URL — accept only image types.
+    if (/^data:image\/(png|jpe?g|gif|webp|svg\+xml);/i.test(trimmed)) {
+      return { src: trimmed };
+    }
+    // 2. http(s):// URL.
+    if (/^https?:\/\//i.test(trimmed)) {
+      try { new URL(trimmed); return { src: trimmed }; }
+      catch { return null; }
+    }
+    // 3. Inline SVG markup → b64-encode as data:image/svg+xml. The browser
+    //    renders SVG-via-img with scripts disabled, so this is safe even when
+    //    the SVG carries embedded <script>.
+    if (/^<svg[\s>]/i.test(trimmed) && /<\/svg>\s*$/i.test(trimmed)) {
+      try {
+        const b64 = btoa(unescape(encodeURIComponent(trimmed)));
+        return { src: `data:image/svg+xml;base64,${b64}` };
+      } catch { return null; }
+    }
+    // 4. Raw base64 (no data: prefix). Must be base64-shaped and a plausible
+    //    image size (≥ 100 chars covers tiny PNGs; ≤ 200kB is our absolute cap).
+    if (/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed) && trimmed.length >= 100) {
+      return { src: `data:image/png;base64,${trimmed}` };
+    }
+    return null;
   }
   function truncMid(s, h, t) {
     s = String(s || "");
@@ -2042,11 +2192,14 @@ body { padding-top: env(safe-area-inset-top, 0); }
       return;
     }
     state.coins = (res && res.response) || [];
-    // Cache token names
+    // Cache token names — always pass through sanitizeTokenName so a
+    // malformed token can't leak ASCII art / control chars into chip
+    // labels, history rows, the selection bar, etc.
     for (const c of state.coins) {
       if (c.tokenid && c.tokenid !== "0x00") {
-        const name = (c.token && (c.token.name && (typeof c.token.name === "string" ? c.token.name : c.token.name.name))) || null;
-        if (name) TOKEN_NAMES.set(c.tokenid, String(name));
+        const rawName = c.token && c.token.name &&
+          (typeof c.token.name === "string" ? c.token.name : c.token.name.name);
+        TOKEN_NAMES.set(c.tokenid, sanitizeTokenName(rawName, c.tokenid));
       }
     }
     // Drop now-spent selections
@@ -2336,32 +2489,32 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // calls. Lives in parallel to the Wallet tab so the UTXO-selection
   // mechanics aren't compromised.
   function tokenMetadata(coin) {
-    // Minima's `c.token.name` is sometimes a plain string, sometimes a
-    // structured object with nested name/description/icon/url. Defensively
-    // peel through both shapes.
+    // Pull raw fields out of the variable Minima shape (c.token.name is
+    // sometimes a string, sometimes a nested object) and HARD-sanitize them
+    // at the boundary. After this function returns, render code can trust
+    // every field to be display-safe and length-bounded.
     const tk = (coin && coin.token) || {};
     const nm = tk.name;
-    let name = "", description = "", icon = "", url = "";
+    let rawName = "", rawDesc = "", rawIcon = "", rawUrl = "";
     if (typeof nm === "string") {
-      name = nm;
+      rawName = nm;
     } else if (nm && typeof nm === "object") {
-      name = String(nm.name || "");
-      description = String(nm.description || "");
-      icon = String(nm.icon || "");
-      url = String(nm.url || "");
+      rawName = typeof nm.name === "string" ? nm.name : "";
+      rawDesc = typeof nm.description === "string" ? nm.description : "";
+      rawIcon = typeof nm.icon === "string" ? nm.icon : "";
+      rawUrl  = typeof nm.url === "string" ? nm.url : "";
     }
+    const tokenid = String(coin.tokenid || "");
     return {
-      tokenid: String(coin.tokenid || ""),
-      name: name,
-      description: description,
-      icon: icon,
-      url: url,
-      decimals: String(tk.decimals || ""),
-      totalSupply: String(tk.totalamount || tk.total || ""),
+      tokenid,
+      name: sanitizeTokenName(rawName, tokenid),
+      description: sanitizeDescription(rawDesc),
+      icon: resolveTokenIcon(rawIcon),  // { src } | null
+      url: (typeof rawUrl === "string" && /^https?:\/\//i.test(rawUrl.trim())) ? rawUrl.trim() : "",
+      decimals: /^[0-9]{1,4}$/.test(String(tk.decimals || "")) ? String(tk.decimals) : "",
     };
   }
   function aggregateBalances() {
-    // Returns { minima: { total, count }, tokens: Map<tokenid, { meta, total, count }> }
     const tokens = new Map();
     let minimaTotal = "0";
     let minimaCount = 0;
@@ -2397,117 +2550,164 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
     const agg = aggregateBalances();
 
-    // Minima total card — prominent, always present (even if zero).
+    // Native Minima always rendered first — even if balance is zero, the user
+    // gets a clear "here's where MINIMA goes" anchor row.
     body.appendChild(renderBalanceCard({
+      meta: {
+        tokenid: "0x00",
+        name: "Minima",
+        description: "The native asset of the Minima blockchain.",
+        icon: null,
+        url: "",
+        decimals: "",
+      },
       symbol: "MINIMA",
-      meta: { name: "Minima", tokenid: "0x00", description: "", icon: "", url: "", decimals: "44", totalSupply: "" },
       total: agg.minima.total,
       count: agg.minima.count,
       isNative: true,
     }));
 
-    // Token cards — sorted by total desc.
     const tokens = [...agg.tokens.values()].sort((a, b) =>
       bigGt(a.total, b.total) ? -1 : 1
     );
-    if (!tokens.length && !isPositive(agg.minima.total)) {
-      body.appendChild(el("div", { class: "balances-empty", text: "No spendable balances yet." }));
+    if (!tokens.length) {
+      body.appendChild(el("div", { class: "balances-empty" },
+        el("div", { class: "balances-empty-glyph", text: "·" }),
+        el("p", null, "No custom tokens held.")));
       return;
     }
     for (const t of tokens) {
       body.appendChild(renderBalanceCard({
-        symbol: t.meta.name || truncMid(t.meta.tokenid, 4, 4),
         meta: t.meta,
+        symbol: t.meta.name,
         total: t.total,
         count: t.count,
         isNative: false,
       }));
     }
   }
-  function renderBalanceCard({ symbol, meta, total, count, isNative }) {
-    const card = el("div", { class: "balance-card" + (isNative ? " native" : "") });
-
-    // Header — icon, symbol, total
-    const head = el("div", { class: "balance-head" });
-    if (meta.icon) {
-      const img = el("img", { class: "balance-icon", alt: "", "aria-hidden": "true" });
-      // Set src after creating so an invalid URL fails quietly (img hides itself).
-      img.src = meta.icon;
-      img.onerror = () => { img.style.display = "none"; };
-      head.appendChild(img);
-    } else {
-      head.appendChild(el("div", { class: "balance-icon placeholder", text: (symbol || "·").charAt(0).toUpperCase() }));
+  // Build the icon slot. Always 48×48, always a defined visual — either a
+  // real image (with hidden fallback to placeholder on load error) or a
+  // brand-coloured monogram for tokens with no usable icon data.
+  function buildBalanceIcon(meta, isNative) {
+    const slot = el("div", { class: "bal-icon-slot" + (isNative ? " native" : "") });
+    if (isNative) {
+      // Built-in Minima glyph — never depends on network or token metadata.
+      // Inline SVG so it stays sharp at any size and matches the lime accent.
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("viewBox", "0 0 48 48");
+      svg.setAttribute("class", "bal-icon-svg");
+      svg.setAttribute("aria-hidden", "true");
+      const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      circle.setAttribute("cx", "24"); circle.setAttribute("cy", "24"); circle.setAttribute("r", "20");
+      circle.setAttribute("fill", "none"); circle.setAttribute("stroke", "currentColor"); circle.setAttribute("stroke-width", "2.2");
+      svg.appendChild(circle);
+      const m = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      m.setAttribute("d", "M14 32 V18 L24 26 L34 18 V32");
+      m.setAttribute("fill", "none"); m.setAttribute("stroke", "currentColor"); m.setAttribute("stroke-width", "2.6");
+      m.setAttribute("stroke-linejoin", "round"); m.setAttribute("stroke-linecap", "round");
+      svg.appendChild(m);
+      slot.appendChild(svg);
+      return slot;
     }
-    const titleWrap = el("div", { class: "balance-title" },
-      el("div", { class: "balance-symbol", text: symbol }),
-      meta.name && meta.name !== symbol
-        ? el("div", { class: "balance-name", text: meta.name })
-        : null,
+    // Token slot. Always render the monogram placeholder; if we have a
+    // real image, layer it on top — the placeholder serves as the fallback
+    // when the image errors or never loads.
+    const monogram = (meta.name && meta.name.charAt(0) || "?").toUpperCase();
+    slot.appendChild(el("span", { class: "bal-icon-mono", text: monogram }));
+    if (meta.icon && meta.icon.src) {
+      const img = el("img", { class: "bal-icon-img", alt: "" });
+      img.setAttribute("aria-hidden", "true");
+      img.referrerPolicy = "no-referrer";
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.onerror = () => { img.remove(); };
+      img.onload = () => { img.classList.add("loaded"); };
+      img.src = meta.icon.src;
+      slot.appendChild(img);
+    }
+    return slot;
+  }
+  function renderBalanceCard({ meta, symbol, total, count, isNative }) {
+    const card = el("div", { class: "bal-card" + (isNative ? " native" : "") });
+
+    // Top row: icon  |  symbol+name  |  amount
+    const top = el("div", { class: "bal-top" });
+    top.appendChild(buildBalanceIcon(meta, isNative));
+
+    const ident = el("div", { class: "bal-ident" });
+    ident.appendChild(el("div", { class: "bal-symbol", text: symbol }));
+    if (meta.name && meta.name !== symbol) {
+      ident.appendChild(el("div", { class: "bal-name", text: meta.name }));
+    }
+    top.appendChild(ident);
+
+    const amountWrap = el("div", { class: "bal-amount-wrap" },
+      el("div", { class: "bal-amount" }, compactAmountSpan(total, 8, { suffix: symbol })),
+      el("div", { class: "bal-count" },
+        document.createTextNode(`${count} coin${count === 1 ? "" : "s"}`)
+      ),
     );
-    head.appendChild(titleWrap);
+    top.appendChild(amountWrap);
+    card.appendChild(top);
 
-    const amountWrap = el("div", { class: "balance-amount" },
-      compactAmountSpan(total, 8, { suffix: symbol }),
-      el("span", { class: "balance-suffix", text: symbol }),
-    );
-    head.appendChild(amountWrap);
-    card.appendChild(head);
-
-    // Sub-line: UTXO count.
-    card.appendChild(el("div", { class: "balance-sub" },
-      el("span", { class: "balance-utxo-count",
-        text: count + " coin" + (count === 1 ? "" : "s") }),
-    ));
-
-    // Description (collapsed inline; many tokens carry useful info here).
+    // Optional description, clamped to 3 lines by default.
     if (meta.description) {
-      card.appendChild(el("div", { class: "balance-desc", text: meta.description }));
+      const descBlock = el("div", { class: "bal-desc-block" });
+      const desc = el("div", { class: "bal-desc clamped", text: meta.description });
+      descBlock.appendChild(desc);
+      // Only show the expand toggle if the text is actually overflowing —
+      // delay the check to after layout so scrollHeight is reliable.
+      const toggle = el("button", { class: "bal-desc-toggle", type: "button", text: "Show more" });
+      toggle.style.display = "none";
+      descBlock.appendChild(toggle);
+      card.appendChild(descBlock);
+      requestAnimationFrame(() => {
+        if (desc.scrollHeight > desc.clientHeight + 2) {
+          toggle.style.display = "inline-block";
+        }
+      });
+      toggle.addEventListener("click", () => {
+        const open = desc.classList.toggle("clamped");
+        toggle.textContent = open ? "Show more" : "Show less";
+      });
     }
 
-    // Details — tokenid, URL, decimals. Native Minima skips these (everyone
-    // knows what MINIMA is).
+    // Details for tokens only.
     if (!isNative) {
-      const meta_rows = el("div", { class: "balance-meta" });
+      const details = el("details", { class: "bal-details" });
+      const summary = el("summary", { class: "bal-details-summary", text: "Details" });
+      details.appendChild(summary);
 
-      // Token ID with truncation + copy
-      const idRow = el("div", { class: "balance-meta-row" });
-      idRow.appendChild(el("span", { class: "balance-meta-label", text: "TokenID" }));
-      idRow.appendChild(el("span", { class: "balance-meta-value mono", text: truncMid(meta.tokenid, 8, 6), title: meta.tokenid }));
-      idRow.appendChild(copyButton(meta.tokenid, "Copy"));
-      meta_rows.appendChild(idRow);
+      const grid = el("div", { class: "bal-detail-grid" });
+      // TokenID
+      grid.appendChild(el("div", { class: "bal-detail-label", text: "Token ID" }));
+      const idVal = el("div", { class: "bal-detail-value" },
+        el("span", { class: "bal-mono", text: truncMid(meta.tokenid, 8, 6), title: meta.tokenid }),
+        copyButton(meta.tokenid, "Copy"),
+      );
+      grid.appendChild(idVal);
 
       // Decimals
       if (meta.decimals) {
-        const decRow = el("div", { class: "balance-meta-row" });
-        decRow.appendChild(el("span", { class: "balance-meta-label", text: "Decimals" }));
-        decRow.appendChild(el("span", { class: "balance-meta-value", text: meta.decimals }));
-        meta_rows.appendChild(decRow);
+        grid.appendChild(el("div", { class: "bal-detail-label", text: "Decimals" }));
+        grid.appendChild(el("div", { class: "bal-detail-value", text: meta.decimals }));
       }
-
-      // URL — only allow http(s) so we never construct a javascript: link from
-      // attacker-controlled token metadata.
-      if (meta.url && /^https?:\/\//i.test(meta.url)) {
-        const urlRow = el("div", { class: "balance-meta-row" });
-        urlRow.appendChild(el("span", { class: "balance-meta-label", text: "URL" }));
+      // URL — already validated http(s) in tokenMetadata, so safe to linkify.
+      if (meta.url) {
+        grid.appendChild(el("div", { class: "bal-detail-label", text: "Website" }));
         const link = el("a", {
-          class: "balance-meta-link",
+          class: "bal-link",
           href: meta.url,
           target: "_blank",
           rel: "noopener noreferrer",
-          text: truncMid(meta.url, 24, 16),
+          text: truncMid(meta.url, 28, 18),
           title: meta.url,
         });
-        urlRow.appendChild(link);
-        meta_rows.appendChild(urlRow);
-      } else if (meta.url) {
-        // Non-http URL: render text only, no clickable link.
-        const urlRow = el("div", { class: "balance-meta-row" });
-        urlRow.appendChild(el("span", { class: "balance-meta-label", text: "URL" }));
-        urlRow.appendChild(el("span", { class: "balance-meta-value", text: meta.url }));
-        meta_rows.appendChild(urlRow);
+        grid.appendChild(el("div", { class: "bal-detail-value" }, link));
       }
-
-      card.appendChild(meta_rows);
+      details.appendChild(grid);
+      card.appendChild(details);
     }
 
     return card;
