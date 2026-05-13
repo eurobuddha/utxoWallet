@@ -1323,7 +1323,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.22";
+  const UTXOWALLET_VERSION = "1.0.23";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -1483,6 +1483,26 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const [w, f = ""] = String(s).split(".");
     const ws = w.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
     return f ? `${ws}.${f}` : ws;
+  }
+  // Display-only truncation for amounts that come from MiniNumber arithmetic
+  // (44-decimal precision). Returns `{ display, full, truncated }` so the
+  // caller can pair the visible string with a hover tooltip that shows the
+  // exact value. Truncation, not rounding — we never want a History row to
+  // show a number that differs from the on-chain amount.
+  function compactAmount(s, maxDecimals) {
+    const str = String(s == null ? "" : s);
+    const dot = str.indexOf(".");
+    if (dot < 0) return { display: formatAmount(str), full: str, truncated: false };
+    const wholeFmt = formatAmount(str.slice(0, dot));
+    const frac = str.slice(dot + 1);
+    if (frac.length <= maxDecimals) {
+      return { display: `${wholeFmt}.${frac}`, full: str, truncated: false };
+    }
+    return {
+      display: `${wholeFmt}.${frac.slice(0, maxDecimals)}…`,
+      full: str,
+      truncated: true,
+    };
   }
   function el(tag, props, ...kids) {
     const e = document.createElement(tag);
@@ -3095,7 +3115,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const val = el("span", { class: "kv-mono", text: display, title: fullAddr });
     wrap.appendChild(val);
     if (opts.amount) {
-      wrap.appendChild(el("span", { class: "kv-amount", text: opts.amount }));
+      const amtEl = el("span", { class: "kv-amount", text: opts.amount });
+      if (opts.amountTitle) amtEl.title = opts.amountTitle;
+      wrap.appendChild(amtEl);
     }
     wrap.appendChild(copyButton(fullAddr));
     return wrap;
@@ -3162,8 +3184,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
       el("span", { class: "row-recipient", text: truncMid(recipientAddr, 12, 10), title: recipientAddr }),
       copyButton(recipientAddr, "Copy"),
     );
-    const amountSpan = el("span", { class: "row-amount" },
-      document.createTextNode(formatAmount(amt)),
+    // MiniNumber arithmetic produces up to 44 decimal places — display-truncate
+    // to 8 so the summary line doesn't overflow the row. The exact amount lives
+    // on the hover tooltip and in the FROM/CHANGE detail rows.
+    const compactAmt = compactAmount(amt, 8);
+    const amountSpan = el("span", {
+      class: "row-amount",
+      title: compactAmt.truncated ? `Exact amount: ${formatAmount(compactAmt.full)} ${tokenLabel(tok)}` : "",
+    },
+      document.createTextNode(compactAmt.display),
       el("span", { class: "tok", text: tokenLabel(tok) }),
     );
     card.appendChild(el("div", { class: "row-summary" },
@@ -3202,8 +3231,14 @@ body { padding-top: env(safe-area-inset-top, 0); }
         const inAmtRaw = isToken
           ? (inp.tokenamount != null ? inp.tokenamount : inp.amount)
           : inp.amount;
-        const inAmtStr = inAmtRaw != null && inAmtRaw !== "" ? formatAmount(String(inAmtRaw)) : "";
-        list.appendChild(addressLine(addr, { amount: inAmtStr }));
+        let inAmtStr = "";
+        let inAmtTitle = "";
+        if (inAmtRaw != null && inAmtRaw !== "") {
+          const c = compactAmount(String(inAmtRaw), 8);
+          inAmtStr = c.display;
+          if (c.truncated) inAmtTitle = `Exact: ${formatAmount(c.full)}`;
+        }
+        list.appendChild(addressLine(addr, { amount: inAmtStr, amountTitle: inAmtTitle }));
       }
       fromSection.appendChild(list);
     } else {
@@ -3243,8 +3278,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
     if (burn && burn !== "0" && burn !== "0.0") {
       const burnSection = el("div", { class: "kv-section" });
       burnSection.appendChild(el("div", { class: "kv-label", text: "BURN" }));
-      burnSection.appendChild(el("div", { class: "kv-row" },
-        el("span", { class: "kv-amount", text: `${formatAmount(burn)} MINIMA` })));
+      const burnC = compactAmount(burn, 8);
+      const burnAmt = el("span", { class: "kv-amount", text: `${burnC.display} MINIMA` });
+      if (burnC.truncated) burnAmt.title = `Exact: ${formatAmount(burnC.full)} MINIMA`;
+      burnSection.appendChild(el("div", { class: "kv-row" }, burnAmt));
       details.appendChild(burnSection);
     }
 
