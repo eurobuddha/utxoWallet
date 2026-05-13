@@ -662,6 +662,161 @@ body { padding-top: env(safe-area-inset-top, 0); }
 }
 .history-foot-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 
+/* v1.0.21 History row redesign — copy-everywhere, clear FROM/TO/CHANGE layout */
+.row-summary {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  margin: 8px 0 6px;
+}
+.row-amount {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--heading);
+  white-space: nowrap;
+}
+.row-amount .tok { font-size: 11px; color: var(--accent); margin-left: 4px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.2px; }
+.row-arrow { color: var(--dim); font-size: 14px; }
+.row-recipient {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+  letter-spacing: 0;
+  cursor: help;
+}
+.row-recipient-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.kv-section {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.kv-section:first-of-type { margin-top: 0; padding-top: 0; border-top: 0; }
+.kv-label {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-bottom: 4px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.kv-label-tag {
+  font-size: 9px;
+  color: var(--accent);
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.kv-label-tag.dim { color: var(--dim2); }
+
+.kv-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text);
+  letter-spacing: 0;
+}
+.kv-row .kv-mono {
+  cursor: help;
+  word-break: break-all;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.kv-row .kv-amount {
+  font-variant-numeric: tabular-nums;
+  color: var(--heading);
+  white-space: nowrap;
+  font-size: 12px;
+}
+.kv-amount {
+  font-variant-numeric: tabular-nums;
+  color: var(--heading);
+  white-space: nowrap;
+  font-size: 12px;
+  font-family: var(--mono);
+}
+.input-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.kv-copy {
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--dim);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+  flex: 0 0 auto;
+}
+.kv-copy:hover { color: var(--accent); border-color: var(--accent); }
+.kv-copy.copied { color: var(--accent); border-color: var(--accent); }
+
+.kv-explorer-link {
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border: 1px solid var(--accent-soft);
+  border-radius: 4px;
+  text-decoration: none;
+  color: var(--accent);
+  background: transparent;
+  transition: background 0.12s;
+}
+.kv-explorer-link:hover { background: var(--accent-soft); }
+
+.row-expand-toggle {
+  background: none;
+  border: none;
+  color: var(--dim);
+  font-family: inherit;
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  cursor: pointer;
+  padding: 4px 0;
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.row-expand-toggle:hover { color: var(--text); }
+.row-details {
+  display: none;
+  margin-top: 8px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+.row-details.open { display: block; }
+.row-terminal-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 /* Explorer link — small inline anchor styled like the other foot actions. */
 .history-explorer-link {
   font-size: 9px;
@@ -800,13 +955,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
   letter-spacing: 1.2px;
   border: 1px solid;
 }
-/* v1.0.14: 5 user-facing pill buckets. Internal SQL still uses the 9 granular
-   codes — statusBucket() maps each to one of these classes. */
-.status-pill.sending           { color: var(--dim);    border-color: var(--border2);       background: var(--surface2); }
-.status-pill.action_needed     { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
-.status-pill.broadcasting      { color: var(--blue);   border-color: var(--blue-soft);     background: var(--blue-soft); }
-.status-pill.confirmed         { color: var(--accent); border-color: var(--accent-soft);   background: var(--accent-soft); }
-.status-pill.issue             { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
+/* v1.0.21: 4 user-facing pill buckets. statusBucket() maps each of the 9
+   internal SQL states to one of these classes. */
+.status-pill.sending       { color: var(--blue);   border-color: var(--blue-soft);     background: var(--blue-soft); }
+.status-pill.action_needed { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
+.status-pill.confirmed     { color: var(--accent); border-color: var(--accent-soft);   background: var(--accent-soft); }
+.status-pill.failed        { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
 
 /* ── Settings ──────────────────────────────────────────────────────── */
 .setting-block { padding: 14px 0; border-bottom: 1px solid var(--border); }
@@ -1169,7 +1323,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.20";
+  const UTXOWALLET_VERSION = "1.0.21";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -1494,7 +1648,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // ─── DB schema + history ───────────────────────────────────────────
   // Schema migration version. Bump alongside any future ALTER step; ensureTable
   // applies only the steps whose version exceeds the last-applied marker.
-  const SCHEMA_VERSION = 3;
+  const SCHEMA_VERSION = 4;
 
   async function getSchemaVersionApplied() {
     return new Promise((resolve) => {
@@ -1553,6 +1707,18 @@ body { padding-top: env(safe-area-inset-top, 0); }
         try { MDS.log("utxoWallet.ensureTable: could_not_confirm rescue v3: " + JSON.stringify(e)); } catch {}
       });
     }
+    if (applied < 4) {
+      // v4: capture source-address info on every send. Pre-v1.0.21 rows stored
+      // only the input coinids array (just hashes); the per-input address that
+      // we DID know at INSERT time was discarded, which made the History row's
+      // "From" side invisible. The new `inputs` CLOB stores a JSON array of
+      // {coinid, address, miniaddress, amount, tokenamount, tokenid} per input,
+      // so the row can render the full FROM list. Old rows have inputs=null and
+      // the renderer falls back to a "(N input coins)" summary.
+      await sql("ALTER TABLE `history` ADD COLUMN `inputs` CLOB").catch((e) => {
+        try { MDS.log("utxoWallet.ensureTable: inputs-column migration v4: " + JSON.stringify(e)); } catch {}
+      });
+    }
     if (applied < SCHEMA_VERSION) setSchemaVersionApplied(SCHEMA_VERSION);
   }
   function sqlQuote(s) {
@@ -1563,9 +1729,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
   async function recordHistoryPosting(rec) {
     if (!validateTxnId(rec.internalid)) throw { stage: "bad-internalid" };
     if (!validateAddress(rec.recipient)) throw { stage: "bad-recipient-cache" };
-    const coinidsJson = JSON.stringify(rec.coinids);
+    // `inputs` is the v1.0.21+ rich-input record; derive the legacy `coinids`
+    // array from it so the existing watcher (which still reads COINIDS) keeps
+    // working without a parallel update path.
+    const inputsArr = Array.isArray(rec.inputs) ? rec.inputs : [];
+    const coinidsArr = inputsArr.length
+      ? inputsArr.map(i => i && i.coinid).filter(Boolean)
+      : (Array.isArray(rec.coinids) ? rec.coinids : []);
+    const coinidsJson = JSON.stringify(coinidsArr);
+    const inputsJson  = JSON.stringify(inputsArr);
     const q =
-      "INSERT INTO history (internalid, txnid, status, recipient, amount, tokenid, coinids, changeaddr, burn, ts, note) VALUES (" +
+      "INSERT INTO history (internalid, txnid, status, recipient, amount, tokenid, coinids, changeaddr, burn, ts, note, inputs) VALUES (" +
       `'${sqlQuote(rec.internalid)}', ` +
       `'${sqlQuote(rec.txnid || rec.internalid)}', ` +
       `'${sqlQuote(rec.status || "posting")}', ` +
@@ -1576,7 +1750,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
       `'${sqlQuote(rec.changeaddr || "")}', ` +
       `'${sqlQuote(rec.burn || "0")}', ` +
       `${parseInt(rec.ts, 10)}, ` +
-      `'${sqlQuote(rec.note || "")}')`;
+      `'${sqlQuote(rec.note || "")}', ` +
+      `'${sqlQuote(inputsJson)}')`;
     await sql(q);
     // Clip to most-recent 500
     await sql("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT 500)").catch(() => {});
@@ -2444,7 +2619,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
       await recordHistoryPosting({
         internalid: txid, txnid: txid, status: "posting",
         recipient, amount, tokenid,
-        coinids: sel.map(c => c.coinid),
+        // Rich per-input record so the History row can show the FROM side
+        // (which addresses we spent from) — previously only coinids survived.
+        inputs: sel.map(c => ({
+          coinid:      c.coinid,
+          address:     c.address || "",
+          miniaddress: c.miniaddress || "",
+          amount:      c.amount != null ? String(c.amount) : "",
+          tokenamount: c.tokenamount != null ? String(c.tokenamount) : null,
+          tokenid:     c.tokenid || "0x00",
+        })),
         changeaddr: change || "", burn: burn || "0", ts: Date.now(),
       });
       recorded = true;
@@ -2862,25 +3046,6 @@ body { padding-top: env(safe-area-inset-top, 0); }
   function renderHistory() {
     const body = document.getElementById("historyBody");
     clearNode(body);
-
-    // If any rows are currently stuck in flight, surface a banner above the list
-    // pointing the user at the most likely cause (READ-mode pending dance).
-    const inFlight = state.history.filter(r => {
-      const b = statusBucket(String(r.STATUS || ""));
-      return b === "action_needed" || b === "sending";
-    });
-    if (inFlight.length > 0 && !state.settings.writeConfirmed) {
-      const banner = el("div", { class: "write-gate" },
-        el("b", null, "Stuck in READ-mode pending? "),
-        document.createTextNode(
-          "Approve the queued actions in MiniHub Pending Actions and then tap " +
-          "“Resume now” on any row that doesn’t advance. For one-tap sends, grant " +
-          "WRITE permission in Settings."
-        ),
-      );
-      body.appendChild(banner);
-    }
-
     if (!state.history.length) {
       body.appendChild(el("div", { class: "empty" },
         el("div", { class: "glyph" }, "📜"),
@@ -2891,72 +3056,223 @@ body { padding-top: env(safe-area-inset-top, 0); }
     }
     for (const row of state.history) body.appendChild(renderHistoryRow(row));
   }
-  // The dapp tracks 9 granular internal SQL statuses; the user sees these 5
-  // buckets. Keep the buckets in lockstep with the .status-pill CSS classes.
+
+  // Helper — single source of truth for "Mx address with copy + hover tooltip".
+  // Used everywhere we render an address in History so every one is copyable.
+  function copyButton(text, btnLabel) {
+    const b = el("button", { class: "kv-copy", type: "button", text: btnLabel || "Copy" });
+    b.title = "Copy: " + text;
+    b.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      copyToClipboard(text, b);
+    });
+    return b;
+  }
+  function addressLine(fullAddr, opts) {
+    opts = opts || {};
+    const wrap = el("div", { class: "kv-row" });
+    const display = truncMid(fullAddr, 12, 10);
+    const val = el("span", { class: "kv-mono", text: display, title: fullAddr });
+    wrap.appendChild(val);
+    if (opts.amount) {
+      wrap.appendChild(el("span", { class: "kv-amount", text: opts.amount }));
+    }
+    wrap.appendChild(copyButton(fullAddr));
+    return wrap;
+  }
+  // The dapp tracks 9 granular internal SQL statuses; v1.0.21 collapses the
+  // user-facing labels down to 4 buckets. Keep in lockstep with .status-pill
+  // CSS classes.
   function statusBucket(s) {
     switch (s) {
       case "posting":
-      case "finalizing":         return "sending";
-      case "awaiting_approval":  return "action_needed";
-      case "posted":             return "broadcasting";
-      case "confirmed":          return "confirmed";
+      case "finalizing":
+      case "posted":             return "sending";        // dapp is working
+      case "awaiting_approval":  return "action_needed";  // user must approve in MiniHub
+      case "confirmed":          return "confirmed";      // terminal happy
       case "error":
       case "rejected":
       case "expired":
-      case "could_not_confirm":  return "issue";
+      case "could_not_confirm":  return "failed";         // terminal sad
       default:                   return "sending";
     }
   }
   function statusLabel(s) {
     switch (statusBucket(s)) {
       case "sending":        return "Sending";
-      case "action_needed":  return "Action needed";
-      case "broadcasting":   return "Broadcasting";
+      case "action_needed":  return "Approve in MiniHub";
       case "confirmed":      return "Confirmed";
-      case "issue":          return "Issue";
+      case "failed":         return "Failed";
       default:               return s;
     }
   }
+  // v1.0.21 rewrite — every address is truncated-display + hover-tooltip-full +
+  // one-click copy. Top of the row shows the at-a-glance summary; Details
+  // expands into a clean key-value layout with FROM / TO / CHANGE / BURN /
+  // TX HASH / ID sections.
   function renderHistoryRow(row) {
     const card = el("div", { class: "history-row" });
-    const status = String(row.STATUS || "");
-    const ts = parseInt(row.TS || 0, 10);
-    const date = ts > 0 ? new Date(ts).toLocaleString() : "—";
-    const amt  = String(row.AMOUNT || "0");
-    const tok  = String(row.TOKENID || "0x00");
-    const txid = String(row.TXNID || "");
-    const internalid = String(row.INTERNALID || "");
-
-    // Direction — every row this dapp writes is a SEND.
-    // If the recipient is one of our wallet addresses, it's a self-send.
+    const status      = String(row.STATUS || "");
+    const ts          = parseInt(row.TS || 0, 10);
+    const date        = ts > 0 ? new Date(ts).toLocaleString() : "—";
+    const amt         = String(row.AMOUNT || "0");
+    const tok         = String(row.TOKENID || "0x00");
+    const txid        = String(row.TXNID || "");
+    const internalid  = String(row.INTERNALID || "");
     const recipientAddr = String(row.RECIPIENT || "");
-    const dir = state.myWalletAddresses.has(recipientAddr) ? "self" : "out";
-    const dirLabel = dir === "self" ? "↻ Self" : "↑ Out";
+    const changeAddr  = String(row.CHANGEADDR || "");
+    const burn        = String(row.BURN || "0");
+    const note        = String(row.NOTE || "");
+    const bucket      = statusBucket(status);
+    const hasRealTxid = txid && !txid.startsWith("uw_");
+    const dir         = state.myWalletAddresses.has(recipientAddr) ? "self" : "out";
+    const dirLabel    = dir === "self" ? "↻ Self" : "↑ Out";
 
+    // Row header — direction, date, status pill (with full NOTE on hover).
     card.appendChild(el("div", { class: "history-head" },
       el("div", { style: { display: "flex", gap: "8px", alignItems: "center" } },
         el("span", { class: "dir-badge " + dir, text: dirLabel }),
         el("span", { class: "history-time", text: date }),
       ),
-      el("span", { class: "status-pill " + statusBucket(status), text: statusLabel(status), title: row.NOTE || "" }),
+      el("span", { class: "status-pill " + bucket, text: statusLabel(status), title: note || "" }),
     ));
-    card.appendChild(el("div", { class: "history-body" },
-      el("div", { class: "to", text: truncMid(recipientAddr, 14, 10) }),
-      el("div", { class: "amt", text: `${formatAmount(amt)} ${tokenLabel(tok)}` }),
-    ));
-    const footRow = el("div", { class: "history-foot" });
-    const hasRealTxid = txid && !txid.startsWith("uw_");
-    footRow.appendChild(el("span", { text: hasRealTxid ? truncMid(txid, 8, 6) : "tx hash pending…" }));
-    const actions = el("div", { class: "history-foot-actions" });
 
-    // Resume button on "action_needed" (awaiting_approval) AND "sending" rows
-    // whose internal code is `finalizing` — both are recoverable in-flight
-    // states where a manual nudge can complete the chain. Plain `posting` rows
-    // are too fresh to retry; the watcher handles them.
-    const bucket = statusBucket(status);
+    // At-a-glance summary line: AMOUNT → RECIPIENT (truncated + copy).
+    const recipWrap = el("div", { class: "row-recipient-wrap" },
+      el("span", { class: "row-recipient", text: truncMid(recipientAddr, 12, 10), title: recipientAddr }),
+      copyButton(recipientAddr, "Copy"),
+    );
+    const amountSpan = el("span", { class: "row-amount" },
+      document.createTextNode(formatAmount(amt)),
+      el("span", { class: "tok", text: tokenLabel(tok) }),
+    );
+    card.appendChild(el("div", { class: "row-summary" },
+      amountSpan,
+      el("span", { class: "row-arrow", text: "→" }),
+      recipWrap,
+    ));
+
+    // Details toggle + expandable section.
+    const details = el("div", { class: "row-details" });
+    const toggle = el("button", { class: "row-expand-toggle", text: "Details ▾" });
+    toggle.addEventListener("click", () => {
+      details.classList.toggle("open");
+      toggle.textContent = details.classList.contains("open") ? "Details ▴" : "Details ▾";
+    });
+
+    // FROM section — every input's source address, copyable.
+    let inputs = null;
+    try { inputs = JSON.parse(row.INPUTS || "null"); } catch {}
+    const fromSection = el("div", { class: "kv-section" });
+    if (Array.isArray(inputs) && inputs.length) {
+      const tag = el("span", { class: "kv-label-tag dim",
+        text: inputs.length + " input coin" + (inputs.length > 1 ? "s" : "") });
+      fromSection.appendChild(el("div", { class: "kv-label" },
+        document.createTextNode("FROM"), tag));
+      const list = el("div", { class: "input-list" });
+      for (const inp of inputs) {
+        const addr = String(inp.miniaddress || inp.address || "");
+        if (!addr) continue;
+        const isToken = (inp.tokenid && inp.tokenid !== "0x00");
+        const inAmtRaw = isToken
+          ? (inp.tokenamount != null ? inp.tokenamount : inp.amount)
+          : inp.amount;
+        const inAmtStr = inAmtRaw != null && inAmtRaw !== ""
+          ? `${formatAmount(String(inAmtRaw))} ${tokenLabel(inp.tokenid || "0x00")}`
+          : "";
+        list.appendChild(addressLine(addr, { amount: inAmtStr }));
+      }
+      fromSection.appendChild(list);
+    } else {
+      // Pre-v1.0.21 row — only coinid hashes captured, no per-input addresses.
+      let legacy = [];
+      try { legacy = JSON.parse(row.COINIDS || "[]"); } catch {}
+      const tag = el("span", { class: "kv-label-tag dim",
+        text: legacy.length + " input coin" + (legacy.length === 1 ? "" : "s") });
+      fromSection.appendChild(el("div", { class: "kv-label" },
+        document.createTextNode("FROM"), tag));
+      fromSection.appendChild(el("div", { class: "kv-row" },
+        el("span", { class: "kv-mono", style: { color: "var(--dim)", fontStyle: "italic" },
+                     text: "(source addresses not captured — pre-1.0.21 row)" }),
+      ));
+    }
+    details.appendChild(fromSection);
+
+    // TO section.
+    const toSection = el("div", { class: "kv-section" });
+    toSection.appendChild(el("div", { class: "kv-label", text: "TO" }));
+    toSection.appendChild(addressLine(recipientAddr, {}));
+    details.appendChild(toSection);
+
+    // CHANGE section (only if a change address was set).
+    if (changeAddr) {
+      const changeIsYours = state.myWalletAddresses.has(changeAddr);
+      const changeLabel = el("div", { class: "kv-label" }, document.createTextNode("CHANGE"));
+      changeLabel.appendChild(el("span", {
+        class: "kv-label-tag" + (changeIsYours ? "" : " dim"),
+        text: changeIsYours ? "yours" : "external",
+      }));
+      const changeSection = el("div", { class: "kv-section" }, changeLabel);
+      changeSection.appendChild(addressLine(changeAddr, {}));
+      details.appendChild(changeSection);
+    }
+
+    // BURN section (only if non-zero).
+    if (burn && burn !== "0" && burn !== "0.0") {
+      const burnSection = el("div", { class: "kv-section" });
+      burnSection.appendChild(el("div", { class: "kv-label", text: "BURN" }));
+      burnSection.appendChild(el("div", { class: "kv-row" },
+        el("span", { class: "kv-amount", text: `${formatAmount(burn)} MINIMA` })));
+      details.appendChild(burnSection);
+    }
+
+    // TX HASH section with Copy + Explorer ↗ when on-chain.
+    const txSection = el("div", { class: "kv-section" });
+    txSection.appendChild(el("div", { class: "kv-label", text: "TX HASH" }));
+    if (hasRealTxid) {
+      const txRow = el("div", { class: "kv-row" });
+      txRow.appendChild(el("span", { class: "kv-mono", text: truncMid(txid, 10, 8), title: txid }));
+      txRow.appendChild(copyButton(txid, "Copy"));
+      txRow.appendChild(el("a", {
+        class: "kv-explorer-link",
+        href: "https://explorer.minima.global/transactions/" + encodeURIComponent(txid),
+        target: "_blank",
+        rel: "noopener noreferrer",
+        text: "Explorer ↗",
+        title: "Open this transaction on explorer.minima.global",
+      }));
+      txSection.appendChild(txRow);
+    } else {
+      txSection.appendChild(el("div", { class: "kv-row" },
+        el("span", { class: "kv-mono", style: { color: "var(--dim)", fontStyle: "italic" },
+                     text: "(not yet captured)" }),
+      ));
+    }
+    details.appendChild(txSection);
+
+    // Internal ID — small but copyable, useful for support / debugging.
+    const idSection = el("div", { class: "kv-section" });
+    idSection.appendChild(el("div", { class: "kv-label", text: "INTERNAL ID" }));
+    idSection.appendChild(addressLine(internalid, {}));
+    details.appendChild(idSection);
+
+    // Note line (status reason) — only if present.
+    if (note) {
+      const noteSection = el("div", { class: "kv-section" });
+      noteSection.appendChild(el("div", { class: "kv-label", text: "NOTE" }));
+      noteSection.appendChild(el("div", { class: "kv-row" },
+        el("span", { class: "kv-mono", style: { fontFamily: "inherit", fontSize: "11px",
+                                                 color: "var(--text)", lineHeight: "1.5" },
+                     text: note })));
+      details.appendChild(noteSection);
+    }
+
+    // Terminal-state action buttons live inside the expanded details to keep
+    // the collapsed view clean.
+    const terminalActions = el("div", { class: "row-terminal-actions" });
     if (bucket === "action_needed" || status === "finalizing") {
-      const resumeBtn = el("button", { class: "history-resume-btn", text: "Resume now" });
-      resumeBtn.title = "Force a finalize attempt now — tap this after approving the latest pending action in MiniHub.";
+      const resumeBtn = el("button", { class: "history-resume-btn", text: "Resume now", type: "button" });
+      resumeBtn.title = "Force a finalize attempt now — after approving the latest pending action in MiniHub.";
       resumeBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         resumeBtn.disabled = true;
@@ -2966,107 +3282,21 @@ body { padding-top: env(safe-area-inset-top, 0); }
           resumeBtn.textContent = "Resume now";
         });
       });
-      actions.appendChild(resumeBtn);
+      terminalActions.appendChild(resumeBtn);
     }
-
-    // Explorer link — direct tx link when we have a real on-chain txpowid;
-    // fallback to a recipient-address search otherwise so the user can still
-    // verify visually (rows promoted via input-absence don't carry a txpowid).
-    if (hasRealTxid) {
-      const a = el("a", {
-        class: "history-explorer-link",
-        href: "https://explorer.minima.global/transactions/" + encodeURIComponent(txid),
-        target: "_blank",
-        rel: "noopener noreferrer",
-        text: "Explorer ↗",
-      });
-      a.title = "Open this transaction on explorer.minima.global";
-      actions.appendChild(a);
-      // Copy-hash button right next to the link — if the explorer page errors,
-      // user can paste the hash into the explorer's search bar manually.
-      const copyBtn = el("button", { class: "history-copy-btn", text: "Copy hash", type: "button" });
-      copyBtn.title = "Copy the full tx hash so you can paste it into the explorer's search bar.";
-      copyBtn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        copyToClipboard(txid, copyBtn);
-      });
-      actions.appendChild(copyBtn);
-    } else if (recipientAddr &&
-               (bucket === "confirmed" || bucket === "broadcasting" || bucket === "issue")) {
-      const a = el("a", {
-        class: "history-explorer-link",
-        href: "https://explorer.minima.global/search?q=" + encodeURIComponent(recipientAddr),
-        target: "_blank",
-        rel: "noopener noreferrer",
-        text: "Search recipient ↗",
-      });
-      a.title = "Open the explorer with the recipient address pre-filled (no on-chain hash captured for this row).";
-      actions.appendChild(a);
-      // Also offer to copy the recipient — same backstop logic.
-      const copyBtn = el("button", { class: "history-copy-btn", text: "Copy addr", type: "button" });
-      copyBtn.title = "Copy the recipient address.";
-      copyBtn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        copyToClipboard(recipientAddr, copyBtn);
-      });
-      actions.appendChild(copyBtn);
-    }
-
-    // Dismiss button on terminal "issue" rows (error/rejected/expired/could_not_confirm).
-    if (bucket === "issue") {
-      const dismissBtn = el("button", { class: "history-dismiss-btn", text: "Dismiss" });
+    if (bucket === "failed") {
+      const dismissBtn = el("button", { class: "history-dismiss-btn", text: "Dismiss", type: "button" });
       dismissBtn.title = "Permanently remove this row from your history.";
       dismissBtn.addEventListener("click", (ev) => {
         ev.stopPropagation();
         dismissBtn.disabled = true;
         dismissHistoryRow(internalid).catch(()=>{}).then(() => loadHistory());
       });
-      actions.appendChild(dismissBtn);
+      terminalActions.appendChild(dismissBtn);
     }
+    if (terminalActions.childNodes.length) details.appendChild(terminalActions);
 
-    const toggle = el("button", { class: "history-detail-toggle", text: "Details ▾" });
-    actions.appendChild(toggle);
-    footRow.appendChild(actions);
-    card.appendChild(footRow);
-
-    // "Waiting for confirmation…" indicator on broadcasting-bucket rows that
-    // haven't been verified on-chain yet. Watcher flips them to `confirmed` on
-    // the next NEWBLOCK (or via input-absence within ~30s).
-    if (bucket === "broadcasting") {
-      card.appendChild(el("div", { class: "confirm-pending",
-        text: "Broadcasting — waiting for confirmation on the next block." }));
-    }
-
-    let coinids = [];
-    try { coinids = JSON.parse(row.COINIDS || "[]"); } catch {}
-    const details = el("div", { class: "history-details" });
-    details.appendChild(el("div", { class: "row" },
-      el("b", { text: "internal id: " }), document.createTextNode(internalid),
-    ));
-    details.appendChild(el("div", { class: "row" },
-      el("b", { text: "tx hash: " }), document.createTextNode(txid),
-    ));
-    details.appendChild(el("div", { class: "row" },
-      el("b", { text: "change → " }), document.createTextNode(String(row.CHANGEADDR || "—")),
-    ));
-    if (row.BURN && row.BURN !== "0") {
-      details.appendChild(el("div", { class: "row" },
-        el("b", { text: "burn: " }), document.createTextNode(`${row.BURN} MINIMA`),
-      ));
-    }
-    if (coinids.length) {
-      details.appendChild(el("div", { class: "row" }, el("b", { text: `${coinids.length} input coin${coinids.length > 1 ? "s" : ""}:` })));
-      for (const cid of coinids) {
-        details.appendChild(el("div", { class: "row", text: "  " + cid }));
-      }
-    }
-    if (row.NOTE) {
-      details.appendChild(el("div", { class: "row" }, el("b", { text: "note: " }), document.createTextNode(String(row.NOTE))));
-    }
-    toggle.addEventListener("click", () => {
-      details.classList.toggle("open");
-      toggle.textContent = details.classList.contains("open") ? "Details ▴" : "Details ▾";
-    });
+    card.appendChild(toggle);
     card.appendChild(details);
     return card;
   }
