@@ -1436,6 +1436,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
       </div>
 
       <div class="setting-block">
+        <div class="setting-title">Node lock state</div>
+        <div class="setting-desc">
+          A Minima node whose wallet vault is password-locked can build transactions but <b>cannot sign them</b> — sends will fail at the signing step. If your node is locked, unlock the vault password (Minima CLI: <code>vault password:&lt;pwd&gt; action:unlock</code> or the dashboard equivalent) before sending.
+        </div>
+        <div class="perm-state" id="lockState">
+          <div class="label" id="lockLabel">Checking…</div>
+          <button class="btn small ghost" id="retestLockBtn">Re-check</button>
+        </div>
+      </div>
+
+      <div class="setting-block">
         <div class="setting-title">About</div>
         <div class="setting-desc">utxoWallet v1.0.0 — explicit UTXO selection for the Minima blockchain. Pending-tx review in MiniHub is your second safety net.</div>
       </div>
@@ -1543,6 +1554,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       defaultChangeMode: "rotate",     // "rotate" (cycle through 64 defaults) | "first" (re-use source coin's address)
       writeConfirmed: false,
       lastWriteConfirmedAt: 0,
+      nodeLocked: false,               // true → wallet vault is password-locked, signing impossible
     },
     lastChangeFallbackReason: null,
     history: [],                       // last loaded
@@ -1565,7 +1577,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.26";
+  const UTXOWALLET_VERSION = "1.0.27";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -1769,16 +1781,40 @@ body { padding-top: env(safe-area-inset-top, 0); }
       try { trimmed = decodeURIComponent(trimmed).trim(); } catch {}
     }
 
-    // 1. data: URL — only image types.
+    // 1. Minima-canonical <artimage>BASE64</artimage> wrapper. This is the
+    //    primary format real-world Minima tokens use — verified against the
+    //    official webWallet decoder. Parse as XML, extract the artimage
+    //    element's text content, wrap as data:image/jpeg;base64,…
+    //    (The webWallet hard-codes jpeg here; gif/png payloads still render
+    //    in <img> because the browser sniffs the actual bytes.)
+    if (/<artimage[\s>][\s\S]*<\/artimage>/i.test(trimmed)) {
+      try {
+        const doc = new DOMParser().parseFromString(trimmed, "application/xml");
+        if (!doc.querySelector("parsererror")) {
+          const node = doc.getElementsByTagName("artimage")[0];
+          if (node && node.textContent) {
+            const b64 = node.textContent.replace(/\s+/g, "");
+            // Sanity-check base64 shape before handing to the browser.
+            if (b64.length > 16 && /^[A-Za-z0-9+/]+={0,2}$/.test(b64)) {
+              return { src: "data:image/jpeg;base64," + b64 };
+            }
+          }
+        }
+      } catch {}
+      // fall through if XML parsing failed
+    }
+    // 2. data: URL — only image types.
     if (/^data:image\/(png|jpe?g|gif|webp|svg\+xml|x-icon|bmp);/i.test(trimmed)) {
       return { src: trimmed };
     }
-    // 2. http(s):// URL — explicitly block other schemes.
+    // 3. http(s):// URL — explicitly block other schemes. (IPFS gateway
+    //    URLs like https://ipfs.io/ipns/… are fetched natively by the
+    //    browser when set on <img src>; no separate fetch step needed.)
     if (/^https?:\/\//i.test(trimmed)) {
       try { new URL(trimmed); return { src: trimmed }; }
       catch { return null; }
     }
-    // 3. Inline SVG markup → b64-encode as data:image/svg+xml. SVG loaded via
+    // 4. Inline SVG markup → b64-encode as data:image/svg+xml. SVG loaded via
     //    <img> has scripts disabled by the browser, so this is safe even when
     //    the markup embeds <script>.
     if (/^<svg[\s>]/i.test(trimmed) && /<\/svg>\s*$/i.test(trimmed)) {
@@ -1787,12 +1823,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
         return { src: `data:image/svg+xml;base64,${b64}` };
       } catch { return null; }
     }
-    // 4. Raw base64 (no data: prefix). Must be base64-shaped and a plausible
+    // 5. Raw base64 (no data: prefix). Must be base64-shaped and a plausible
     //    image size (≥ 100 chars covers tiny PNGs).
     if (/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed) && trimmed.length >= 100) {
       return { src: `data:image/png;base64,${trimmed}` };
     }
-    // 5. Anything else (plain text, ASCII art, unknown scheme) — drop it and
+    // 6. Anything else (plain text, ASCII art, unknown scheme) — drop it and
     //    let the placeholder / fallback take over.
     return null;
   }
@@ -1936,6 +1972,40 @@ body { padding-top: env(safe-area-inset-top, 0); }
     }
     renderSettingsPermBlock();
     renderSelectionBar();
+  }
+
+  // ─── Probe NODE LOCK state ─────────────────────────────────────────
+  // A Minima node whose wallet vault is password-locked CAN accept
+  // txncreate / txninput / txnoutput, but `txnsign publickey:auto` will
+  // throw "KeysDB LOCKED. No Private Keys.." from Wallet.signData. The
+  // `status` command surfaces this state at response.locked. Probe at boot
+  // + before every send so the UI can refuse cleanly instead of building
+  // a transaction that will silently fail to sign.
+  async function probeNodeLock() {
+    try {
+      const s = await mds("status");
+      const locked = !!(s && s.response && s.response.locked);
+      state.settings.nodeLocked = locked;
+    } catch {
+      // Couldn't read status — leave previous value. Don't auto-clear it,
+      // because a transient read failure shouldn't mark the node as
+      // unlocked when it isn't.
+    }
+    renderSettingsPermBlock();
+    renderSelectionBar();
+  }
+  // Recognise the locked-vault error from any MDS response so we can
+  // surface a clear toast even if the rejection comes from buildTransaction's
+  // catch path. The Minima source throws "KeysDB LOCKED. No Private Keys.."
+  // from Wallet.signData; older builds may say "wallet is locked" or
+  // similar — match a couple of variants.
+  function isLockedNodeError(err) {
+    if (!err) return false;
+    const text = String(err.error || err.message || err.stage || err).toLowerCase();
+    return text.includes("keysdb locked") ||
+           text.includes("no private keys") ||
+           text.includes("wallet is locked") ||
+           (text.includes("locked") && text.includes("sign"));
   }
 
   // ─── Stale-txn sweeper ─────────────────────────────────────────────
@@ -2507,8 +2577,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
       tot.appendChild(lab);
     }
     clearBtn.disabled = n === 0;
-    sendBtn.disabled  = n === 0 || !state.settings.writeConfirmed || state.pendingTxId !== null;
-    sendBtn.title = !state.settings.writeConfirmed ? "Grant WRITE permission in Settings first." : "";
+    sendBtn.disabled = n === 0 ||
+      !state.settings.writeConfirmed ||
+      state.settings.nodeLocked ||
+      state.pendingTxId !== null;
+    sendBtn.title = state.settings.nodeLocked
+      ? "Node is locked (vault password not entered). Unlock the node before sending."
+      : (!state.settings.writeConfirmed ? "Grant WRITE permission in Settings first." : "");
   }
 
   // ─── Balances tab ──────────────────────────────────────────────────
@@ -2832,6 +2907,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
         toast("Grant WRITE permission first.", "warn");
         return;
       }
+    }
+    // Re-check the node lock immediately before opening the send modal.
+    // A node could have been locked between boot and now (e.g., the user
+    // ran `vault lock`), so we don't want to walk the user through building
+    // a transaction that's guaranteed to fail at the txnsign step.
+    await probeNodeLock();
+    if (state.settings.nodeLocked) {
+      tabSwitch("settings");
+      toast("Node is locked — unlock the vault password before sending. See Settings for details.", "error");
+      return;
     }
     const selected = selectedCoins();
     const total = selectedTotal();
@@ -3437,6 +3522,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
       if (state.pendingTxId === txid) {
         await mds(`txndelete id:${txid}`).catch(() => {});
       }
+      // Specific surfacing for the locked-vault case. The MDS rejection's
+      // error text comes from Minima's Wallet.signData throwing "KeysDB
+      // LOCKED. No Private Keys.." — without an explicit toast the user
+      // just sees "Send failed", which was the original silent-failure bug.
+      if (isLockedNodeError(err)) {
+        state.settings.nodeLocked = true;
+        renderSelectionBar();
+        renderSettingsPermBlock();
+        toast("Node is locked — private keys unavailable. Unlock the vault password (Minima vault command / dashboard) then retry.", "error");
+        try { MDS.notify("utxoWallet: send failed — node vault is locked."); } catch {}
+      }
       if (recorded) {
         await markHistoryStatus(txid, "error", (err && err.message) || (err && err.error) || "").catch(() => {});
       }
@@ -4036,14 +4132,26 @@ body { padding-top: env(safe-area-inset-top, 0); }
   function renderSettingsPermBlock() {
     const ps = document.getElementById("permState");
     const pl = document.getElementById("permLabel");
-    if (!ps || !pl) return;
-    if (state.settings.writeConfirmed) {
-      ps.className = "perm-state ok";
-      const when = state.settings.lastWriteConfirmedAt ? new Date(state.settings.lastWriteConfirmedAt).toLocaleTimeString() : "now";
-      pl.textContent = `✓ Confirmed at ${when}`;
-    } else {
-      ps.className = "perm-state bad";
-      pl.textContent = "✗ Not granted — Send is disabled";
+    if (ps && pl) {
+      if (state.settings.writeConfirmed) {
+        ps.className = "perm-state ok";
+        const when = state.settings.lastWriteConfirmedAt ? new Date(state.settings.lastWriteConfirmedAt).toLocaleTimeString() : "now";
+        pl.textContent = `✓ Confirmed at ${when}`;
+      } else {
+        ps.className = "perm-state bad";
+        pl.textContent = "✗ Not granted — Send is disabled";
+      }
+    }
+    const ls = document.getElementById("lockState");
+    const ll = document.getElementById("lockLabel");
+    if (ls && ll) {
+      if (state.settings.nodeLocked) {
+        ls.className = "perm-state bad";
+        ll.textContent = "✗ LOCKED — unlock vault password to sign";
+      } else {
+        ls.className = "perm-state ok";
+        ll.textContent = "✓ Unlocked — signing available";
+      }
     }
   }
 
@@ -4101,6 +4209,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
       btn.disabled = true;
       try { await probeWritePermission(); } finally { btn.disabled = false; }
     });
+    document.getElementById("retestLockBtn").addEventListener("click", async () => {
+      const btn = document.getElementById("retestLockBtn");
+      btn.disabled = true;
+      try { await probeNodeLock(); } finally { btn.disabled = false; }
+    });
     // Backdrop click to close
     document.getElementById("sendModal").addEventListener("click", (e) => {
       if (e.target.id === "sendModal") closeSendModal();
@@ -4128,6 +4241,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       try {
         await ensureTable();
         await probeWritePermission();
+        await probeNodeLock();
         await refreshDefaultAddress();
         await sweepStaleTxns();
         await loadCoins();
