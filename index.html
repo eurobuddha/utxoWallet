@@ -1577,7 +1577,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.28";
+  const UTXOWALLET_VERSION = "1.0.29";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -1587,6 +1587,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // Token decimals cache (for nicer display only — math is BigInt-string-safe)
   const TOKEN_NAMES = new Map();
   TOKEN_NAMES.set("0x00", "MINIMA");
+  // Rich per-token metadata keyed by tokenid. Populated from the `balance`
+  // MDS command (which carries full token info — name object, url, decimals)
+  // because the `coins relevant:true` response only gives sparse data per
+  // UTXO. The official Minima wallet uses `balance` for the same reason.
+  const TOKEN_DATA = new Map();
 
   const DEFAULT_WALLET_SCRIPT_RE =
     /^\s*RETURN\s+SIGNEDBY\s*\(\s*0x[0-9a-fA-F]+\s*\)\s*$/i;
@@ -1794,30 +1799,32 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // fetch completes successfully we re-render the Balances tab (if visible)
   // so the new blob URL takes effect.
   function preResolveTokenIcons() {
-    for (const c of state.coins) {
-      if (!c || !c.token || !c.tokenid || c.tokenid === "0x00") continue;
-      if (typeof c.token.url !== "string" || !c.token.url) continue;
-      if (_tokenIconCache.has(c.tokenid)) continue;
-      if (_tokenIconFetches.has(c.tokenid)) continue;
+    // Iterate over the rich-metadata source (`balance` → TOKEN_DATA), not
+    // state.coins (whose `c.token` field is often sparse and missing url).
+    for (const [tokenid, tk] of TOKEN_DATA) {
+      if (!tokenid || tokenid === "0x00") continue;
+      if (!tk || typeof tk.url !== "string" || !tk.url) continue;
+      if (_tokenIconCache.has(tokenid)) continue;
+      if (_tokenIconFetches.has(tokenid)) continue;
 
       let decoded;
-      try { decoded = decodeURIComponent(c.token.url); } catch { decoded = c.token.url; }
+      try { decoded = decodeURIComponent(tk.url); } catch { decoded = tk.url; }
 
       if (decoded.startsWith("https://ipfs.io/ipns/") || decoded.startsWith("https://ipfs.io/ipfs/")) {
         const job = (async () => {
           const blob = await fetchIpfsAsBlob(decoded);
-          if (blob) _tokenIconCache.set(c.tokenid, blob);
-          _tokenIconFetches.delete(c.tokenid);
+          if (blob) _tokenIconCache.set(tokenid, blob);
+          _tokenIconFetches.delete(tokenid);
           if (state.activeTab === "balances") renderBalances();
         })();
-        _tokenIconFetches.set(c.tokenid, job);
+        _tokenIconFetches.set(tokenid, job);
       }
     }
   }
   function resolveTokenIcon(raw) {
     if (typeof raw !== "string") return null;
     let trimmed = raw.trim();
-    if (!trimmed || trimmed.length > 200000) return null;
+    if (!trimmed) return null;
 
     // The canonical Minima encoding stores `c.token.url` URL-encoded. Try
     // decoding once; ignore on failure so a non-encoded URL still works.
@@ -1827,25 +1834,32 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
     // 1. Minima-canonical <artimage>BASE64</artimage> wrapper. This is the
     //    primary format real-world Minima tokens use — verified against the
-    //    official webWallet decoder. Parse as XML, extract the artimage
-    //    element's text content, wrap as data:image/jpeg;base64,…
-    //    (The webWallet hard-codes jpeg here; gif/png payloads still render
-    //    in <img> because the browser sniffs the actual bytes.)
-    if (/<artimage[\s>][\s\S]*<\/artimage>/i.test(trimmed)) {
+    //    official wallet 2.47.2 (makeTokenImage) and the legacy webWallet
+    //    (bundle's Yg function). The official decoder wraps the inner text
+    //    as data:image/jpeg;base64,…  Browsers sniff the actual bytes so
+    //    PNG / GIF payloads still render through the jpeg MIME label.
+    if (trimmed.startsWith("<artimage>") || /^<artimage[\s>]/i.test(trimmed)) {
+      // Prefer DOMParser (matches the official decoder); fall back to a
+      // regex extract if XML parsing fails (some tokens carry stray bytes
+      // before/after the wrapper that break strict XML mode).
+      let inner = null;
       try {
         const doc = new DOMParser().parseFromString(trimmed, "application/xml");
         if (!doc.querySelector("parsererror")) {
           const node = doc.getElementsByTagName("artimage")[0];
-          if (node && node.textContent) {
-            const b64 = node.textContent.replace(/\s+/g, "");
-            // Sanity-check base64 shape before handing to the browser.
-            if (b64.length > 16 && /^[A-Za-z0-9+/]+={0,2}$/.test(b64)) {
-              return { src: "data:image/jpeg;base64," + b64 };
-            }
-          }
+          if (node) inner = node.textContent;
         }
       } catch {}
-      // fall through if XML parsing failed
+      if (!inner) {
+        const m = trimmed.match(/<artimage[^>]*>([\s\S]*?)<\/artimage>/i);
+        if (m) inner = m[1];
+      }
+      if (inner) {
+        const b64 = inner.replace(/\s+/g, "");
+        if (b64.length > 16) {
+          return { src: "data:image/jpeg;base64," + b64 };
+        }
+      }
     }
     // 2. data: URL — only image types.
     if (/^data:image\/(png|jpe?g|gif|webp|svg\+xml|x-icon|bmp);/i.test(trimmed)) {
@@ -2354,10 +2368,41 @@ body { padding-top: env(safe-area-inset-top, 0); }
     rebuildGroups();
     renderWallet();
     renderSelectionBar();
-    // Kick off any IPFS icon fetches in the background; they'll trigger a
-    // Balances re-render when they complete (cached for subsequent calls).
-    preResolveTokenIcons();
+    // Refresh rich token metadata (icons, descriptions) from `balance`. This
+    // happens in parallel-no-await with the rest of the render so the wallet
+    // stays responsive even if `balance` is slow. Done after rebuildGroups so
+    // the Balances tab has UTXO counts to display.
+    loadBalance().then(() => {
+      preResolveTokenIcons();
+      if (state.activeTab === "balances") renderBalances();
+    }).catch(() => {});
     if (state.activeTab === "balances") renderBalances();
+  }
+  // `balance` returns per-token aggregated info with FULL token metadata —
+  // name object, url (icon), decimals, etc. `coins relevant:true` gives a
+  // sparser `token` field per UTXO that often lacks the url. Mirror the
+  // official Minima wallet by reading icons from `balance`.
+  async function loadBalance() {
+    let res;
+    try { res = await mds("balance"); }
+    catch (e) {
+      try { MDS.log("utxoWallet loadBalance error: " + JSON.stringify(e)); } catch {}
+      return;
+    }
+    const list = (res && res.response) || [];
+    for (const entry of list) {
+      if (entry && entry.tokenid && entry.token) {
+        TOKEN_DATA.set(entry.tokenid, entry.token);
+        // Also refresh the human-name cache (`balance` carries the canonical
+        // name object; we may previously have cached a sparser version).
+        if (entry.tokenid !== "0x00") {
+          const nm = entry.token.name;
+          const rawName = typeof nm === "string" ? nm
+                       : (nm && typeof nm.name === "string" ? nm.name : "");
+          if (rawName) TOKEN_NAMES.set(entry.tokenid, sanitizeTokenName(rawName, entry.tokenid));
+        }
+      }
+    }
   }
   function rebuildGroups() {
     state.groups = new Map();
@@ -2650,8 +2695,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
     //   c.token.decimals    — string number, sometimes integer
     //
     // Sanitize everything at the boundary so render code can trust the result.
-    const tk = (coin && coin.token) || {};
     const tokenid = String(coin.tokenid || "");
+    // Prefer the rich token object from `balance` (TOKEN_DATA cache). Falls
+    // back to coin.token (sparse — often missing the url) when balance hasn't
+    // loaded yet.
+    const tk = TOKEN_DATA.get(tokenid) || (coin && coin.token) || {};
     const nm = tk.name;
     let rawName = "", rawDesc = "", rawIcon = "", rawWebsite = "";
 
