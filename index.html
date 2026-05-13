@@ -1323,7 +1323,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.21";
+  const UTXOWALLET_VERSION = "1.0.22";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -1681,7 +1681,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
       "  `changeaddr` varchar(80)," +
       "  `burn` varchar(64)," +
       "  `ts` bigint NOT NULL," +
-      "  `note` varchar(255)" +
+      "  `note` varchar(255)," +
+      "  `inputs` clob" +
       ")"
     );
 
@@ -1719,7 +1720,22 @@ body { padding-top: env(safe-area-inset-top, 0); }
         try { MDS.log("utxoWallet.ensureTable: inputs-column migration v4: " + JSON.stringify(e)); } catch {}
       });
     }
-    if (applied < SCHEMA_VERSION) setSchemaVersionApplied(SCHEMA_VERSION);
+    // Verify the column actually exists before bumping the schema marker.
+    // If the ALTER failed for a real reason (corrupt page, disk, syntax drift),
+    // we want the next boot to retry — not silently stamp v4 and break every
+    // future INSERT against the missing column.
+    if (applied < SCHEMA_VERSION) {
+      const cols = await sql("SHOW COLUMNS FROM `history`").catch(() => []);
+      const hasInputs = cols.some(c => {
+        const n = String(c.FIELD || c.NAME || c.COLUMN_NAME || "").toLowerCase();
+        return n === "inputs";
+      });
+      if (hasInputs) {
+        setSchemaVersionApplied(SCHEMA_VERSION);
+      } else {
+        try { MDS.log("utxoWallet.ensureTable: schema marker NOT bumped — `inputs` column missing after migration; will retry on next boot."); } catch {}
+      }
+    }
   }
   function sqlQuote(s) {
     // Single-quote-escape for SQL string literals. Pair with regex pre-validation;
@@ -2629,7 +2645,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
           tokenamount: c.tokenamount != null ? String(c.tokenamount) : null,
           tokenid:     c.tokenid || "0x00",
         })),
-        changeaddr: change || "", burn: burn || "0", ts: Date.now(),
+        // Only persist a change address when an actual change output is emitted —
+        // otherwise the History row would show a misleading "CHANGE → Mx…" line
+        // for funds that never moved.
+        changeaddr: isPositive(changeAmt) ? (change || "") : "",
+        burn: burn || "0", ts: Date.now(),
       });
       recorded = true;
       stage("record", "done");
@@ -3164,11 +3184,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
     let inputs = null;
     try { inputs = JSON.parse(row.INPUTS || "null"); } catch {}
     const fromSection = el("div", { class: "kv-section" });
+    const pluralCoins = (n) => `${n} input coin${n === 1 ? "" : "s"}`;
     if (Array.isArray(inputs) && inputs.length) {
-      const tag = el("span", { class: "kv-label-tag dim",
-        text: inputs.length + " input coin" + (inputs.length > 1 ? "s" : "") });
-      fromSection.appendChild(el("div", { class: "kv-label" },
-        document.createTextNode("FROM"), tag));
+      // All inputs in a send share the same tokenid (selection bar enforces it),
+      // so render the token label once in the FROM header and just the bare
+      // amount on each input row.
+      const firstTokenid = String((inputs[0] && inputs[0].tokenid) || tok || "0x00");
+      const headerLabel = el("div", { class: "kv-label" }, document.createTextNode("FROM"));
+      headerLabel.appendChild(el("span", { class: "kv-label-tag dim", text: pluralCoins(inputs.length) }));
+      headerLabel.appendChild(el("span", { class: "kv-label-tag", text: tokenLabel(firstTokenid) }));
+      fromSection.appendChild(headerLabel);
       const list = el("div", { class: "input-list" });
       for (const inp of inputs) {
         const addr = String(inp.miniaddress || inp.address || "");
@@ -3177,9 +3202,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
         const inAmtRaw = isToken
           ? (inp.tokenamount != null ? inp.tokenamount : inp.amount)
           : inp.amount;
-        const inAmtStr = inAmtRaw != null && inAmtRaw !== ""
-          ? `${formatAmount(String(inAmtRaw))} ${tokenLabel(inp.tokenid || "0x00")}`
-          : "";
+        const inAmtStr = inAmtRaw != null && inAmtRaw !== "" ? formatAmount(String(inAmtRaw)) : "";
         list.appendChild(addressLine(addr, { amount: inAmtStr }));
       }
       fromSection.appendChild(list);
@@ -3187,10 +3210,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
       // Pre-v1.0.21 row — only coinid hashes captured, no per-input addresses.
       let legacy = [];
       try { legacy = JSON.parse(row.COINIDS || "[]"); } catch {}
-      const tag = el("span", { class: "kv-label-tag dim",
-        text: legacy.length + " input coin" + (legacy.length === 1 ? "" : "s") });
-      fromSection.appendChild(el("div", { class: "kv-label" },
-        document.createTextNode("FROM"), tag));
+      const headerLabel = el("div", { class: "kv-label" }, document.createTextNode("FROM"));
+      headerLabel.appendChild(el("span", { class: "kv-label-tag dim", text: pluralCoins(legacy.length) }));
+      fromSection.appendChild(headerLabel);
       fromSection.appendChild(el("div", { class: "kv-row" },
         el("span", { class: "kv-mono", style: { color: "var(--dim)", fontStyle: "italic" },
                      text: "(source addresses not captured — pre-1.0.21 row)" }),
@@ -3250,10 +3272,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
     }
     details.appendChild(txSection);
 
-    // Internal ID — small but copyable, useful for support / debugging.
+    // Internal ID — short enough to show in full; useful for support / debugging.
     const idSection = el("div", { class: "kv-section" });
     idSection.appendChild(el("div", { class: "kv-label", text: "INTERNAL ID" }));
-    idSection.appendChild(addressLine(internalid, {}));
+    const idRow = el("div", { class: "kv-row" });
+    idRow.appendChild(el("span", { class: "kv-mono", text: internalid, title: internalid }));
+    idRow.appendChild(copyButton(internalid, "Copy"));
+    idSection.appendChild(idRow);
     details.appendChild(idSection);
 
     // Note line (status reason) — only if present.
