@@ -514,6 +514,26 @@ body { padding-top: env(safe-area-inset-top, 0); }
   opacity: 0.4;
   cursor: not-allowed;
 }
+.field textarea {
+  width: 100%;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 11px 12px;
+  color: var(--heading);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  letter-spacing: 0;
+  outline: none;
+  resize: vertical;
+  min-height: 64px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.field textarea:focus {
+  border-color: var(--accent);
+  background: var(--surface);
+}
 .field-note {
   margin-top: 5px;
   font-size: 10px;
@@ -1469,6 +1489,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
           <button class="btn ghost small" id="toolsBtn" disabled>Tools ▾</button>
           <div class="tools-popover" id="toolsPopover" hidden>
             <button class="tools-item" id="splitItem" type="button">Split selected…</button>
+            <button class="tools-item" id="distributeItem" type="button">Distribute selected…</button>
             <button class="tools-item" id="untrackItem" type="button">Untrack selected</button>
           </div>
         </div>
@@ -1684,6 +1705,45 @@ body { padding-top: env(safe-area-inset-top, 0); }
   </div>
 </div>
 
+<!-- Distribute modal -->
+<div class="modal-backdrop" id="distributeModal">
+  <div class="modal">
+    <div class="modal-title">Distribute selected coins</div>
+    <div id="distributeSummary" class="tx-section"></div>
+    <div class="setting-desc" style="margin: 10px 0 4px;">
+      Sends a fixed amount to many addresses in one transaction — to all of your own wallet
+      addresses, or to a list you paste in. Any remainder returns to you as change.
+    </div>
+    <div class="field">
+      <div class="field-label"><span class="label">Send to</span></div>
+      <label class="radio-row"><input type="radio" name="distributeSource" value="my" checked>
+        <div class="text"><div class="head">My wallet addresses</div><div class="sub">Every default address this node tracks. Spreads coins across your own wallet.</div></div></label>
+      <label class="radio-row"><input type="radio" name="distributeSource" value="external">
+        <div class="text"><div class="head">External list</div><div class="sub">Paste Mx / 0x addresses below — one per line, or comma / space separated.</div></div></label>
+    </div>
+    <div class="field" id="distributeListField" style="display:none">
+      <div class="field-label"><span class="label">Addresses</span></div>
+      <textarea id="distributeListInput" rows="4" placeholder="Mx…&#10;Mx…&#10;0x…" autocomplete="off" spellcheck="false"></textarea>
+      <div class="field-note" id="distributeListNote"></div>
+    </div>
+    <div class="field">
+      <div class="field-label"><span class="label">Amount to each address</span></div>
+      <input type="text" id="distributeAmountInput" placeholder="0.000000" inputmode="decimal" autocomplete="off" spellcheck="false">
+      <div class="field-note" id="distributeAmountNote"></div>
+    </div>
+    <div class="field" id="distributeBurnField">
+      <div class="field-label"><span class="label">Burn (Minima only — optional)</span></div>
+      <input type="text" id="distributeBurnInput" placeholder="0" inputmode="decimal" autocomplete="off" spellcheck="false">
+      <div class="field-note" id="distributeBurnNote"></div>
+    </div>
+    <div class="field-note info" id="distributeSummaryNote"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="distributeCancelBtn">Cancel</button>
+      <button class="btn primary" id="distributePreviewBtn">Preview →</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-stack" id="toastStack"></div>
 
 <script>
@@ -1732,7 +1792,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.34";
+  const UTXOWALLET_VERSION = "1.0.35";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -4125,6 +4185,196 @@ body { padding-top: env(safe-area-inset-top, 0); }
       btn.disabled = false;
     }
   }
+
+  // ─── Distribute modal ──────────────────────────────────────────────
+  // Send a fixed amount to many addresses in one transaction — either every
+  // wallet address this node tracks, or a pasted external list. A multi-output
+  // transaction through the shared buildTransaction machinery.
+  const DISTRIBUTE_SOFT_CAP = 50;  // outputs above this risk the TxPoW size limit
+  function closeDistributeModal() {
+    const m = document.getElementById("distributeModal");
+    if (m) m.classList.remove("open");
+  }
+  async function openDistributeModal() {
+    closeToolsPopover();
+    if (state.selected.size === 0) return;
+    if (!state.settings.writeConfirmed) {
+      await probeWritePermission();
+      if (!state.settings.writeConfirmed) {
+        tabSwitch("settings");
+        toast("Grant WRITE permission first.", "warn");
+        return;
+      }
+    }
+    await probeNodeLock();
+    if (state.settings.nodeLocked) {
+      tabSwitch("settings");
+      toast("Node is locked — unlock the vault password before distributing.", "error");
+      return;
+    }
+    const selected = selectedCoins();
+    const total = selectedTotal();
+    const isMinima = state.selectedTokenid === "0x00" || state.selectedTokenid === null;
+    const tokLab = tokenLabel(state.selectedTokenid || "0x00");
+
+    const summary = document.getElementById("distributeSummary");
+    clearNode(summary);
+    summary.appendChild(el("div", { class: "tx-section-label", text: "Selected coins" }));
+    for (const c of selected) {
+      summary.appendChild(el("div", { class: "tx-row" },
+        el("div", { class: "left", text: truncMid(c.coinid, 8, 6) }),
+        el("div", { class: "right", text: formatAmount(coinAmt(c)) }),
+      ));
+    }
+    summary.appendChild(el("div", { class: "tx-row total" },
+      el("div", { class: "left", text: "Total" }),
+      el("div", { class: "right", text: `${formatAmount(total)} ${tokLab}` }),
+    ));
+
+    for (const r of document.querySelectorAll('input[name="distributeSource"]')) {
+      r.checked = (r.value === "my");
+    }
+    document.getElementById("distributeListField").style.display = "none";
+    document.getElementById("distributeListInput").value = "";
+    document.getElementById("distributeAmountInput").value = "";
+    document.getElementById("distributeBurnInput").value = "";
+    document.getElementById("distributeBurnField").style.display = isMinima ? "" : "none";
+    setNote("distributeListNote", "", "");
+    setNote("distributeAmountNote", "", "");
+    setNote("distributeBurnNote", "", "");
+    setNote("distributeSummaryNote", "", "info");
+    // Don't run the live summary yet — the amount field is empty on open and
+    // we don't want to flash a validation error before the user types.
+    document.getElementById("distributeModal").classList.add("open");
+  }
+  // Resolve the target address list from the selected source.
+  // Returns { addresses: [...unique valid...], invalidCount, mode }.
+  function getDistributeTargets() {
+    const sourceEl = document.querySelector('input[name="distributeSource"]:checked');
+    const mode = sourceEl ? sourceEl.value : "my";
+    if (mode === "my") {
+      return { addresses: [...state.myWalletAddresses], invalidCount: 0, mode };
+    }
+    // External list — split on newline / comma / whitespace, validate, dedupe.
+    const raw = String(document.getElementById("distributeListInput").value || "");
+    const parts = raw.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+    const seen = new Set();
+    const addresses = [];
+    let invalidCount = 0;
+    for (const p of parts) {
+      if (!validateAddress(p)) { invalidCount++; continue; }
+      if (seen.has(p)) continue;
+      seen.add(p);
+      addresses.push(p);
+    }
+    return { addresses, invalidCount, mode };
+  }
+  // Validate the form. Returns { targets, perAddr, burn, changeAmt } or null.
+  function readDistributeForm() {
+    const isMinima = state.selectedTokenid === "0x00" || state.selectedTokenid === null;
+    const total = selectedTotal();
+    const { addresses, invalidCount, mode } = getDistributeTargets();
+    let ok = true;
+
+    if (mode === "external") {
+      if (invalidCount > 0) {
+        setNote("distributeListNote",
+          `${addresses.length} valid · ${invalidCount} invalid (skipped)`, invalidCount && !addresses.length ? "error" : "warn");
+      } else {
+        setNote("distributeListNote", addresses.length ? `${addresses.length} valid address${addresses.length === 1 ? "" : "es"}` : "", "info");
+      }
+    } else {
+      setNote("distributeListNote", "", "");
+    }
+    if (!addresses.length) {
+      if (mode === "external") setNote("distributeListNote", "Paste at least one valid address.", "error");
+      else setNote("distributeSummaryNote", "No wallet addresses found on this node yet.", "error");
+      ok = false;
+    }
+
+    const amtRaw = String(document.getElementById("distributeAmountInput").value || "").trim();
+    // max = total: a single per-address amount can't exceed the whole selection.
+    // The finer "n × perAddr + burn ≤ total" check happens below.
+    const va = validateAmount(amtRaw, total);
+    let perAddr = "0";
+    if (!va.ok) {
+      const m = va.err === "exceeds" ? "Amount exceeds your selected total."
+              : va.err === "nonpositive" ? "Amount must be greater than 0."
+              : "Enter a valid amount.";
+      setNote("distributeAmountNote", m, "error"); ok = false;
+    } else {
+      setNote("distributeAmountNote", "", ""); perAddr = va.normalized;
+    }
+
+    let burn = "0";
+    if (isMinima) {
+      const burnRaw = String(document.getElementById("distributeBurnInput").value || "").trim() || "0";
+      const vb = validateBurn(burnRaw);
+      if (!vb.ok) { setNote("distributeBurnNote", "Invalid burn amount.", "error"); ok = false; }
+      else { setNote("distributeBurnNote", "", ""); burn = normalizeAmount(vb.normalized || "0"); }
+    }
+    if (!ok) return null;
+
+    const n = addresses.length;
+    const totalOut = bigMul(perAddr, String(n));
+    const needed = bigAdd(totalOut, burn);
+    if (bigGt(needed, total)) {
+      setNote("distributeSummaryNote",
+        `Not enough: ${n} × ${formatAmount(perAddr)} + burn = ${formatAmount(needed)}, but only ${formatAmount(total)} selected.`,
+        "error");
+      return null;
+    }
+    const changeAmt = bigSub(total, needed);
+    return { targets: addresses, perAddr, burn, changeAmt };
+  }
+  function updateDistributeSummary() {
+    const form = readDistributeForm();
+    if (!form) return;  // readDistributeForm already set the relevant error note
+    const tokLab = tokenLabel(state.selectedTokenid || "0x00");
+    const n = form.targets.length;
+    const totalOut = bigMul(form.perAddr, String(n));
+    let msg = `${n} address${n === 1 ? "" : "es"} × ${formatAmount(form.perAddr)} = ${formatAmount(totalOut)} ${tokLab}`;
+    if (isPositive(form.burn)) msg += ` · burn ${formatAmount(form.burn)}`;
+    if (isPositive(form.changeAmt)) msg += ` · change ${formatAmount(form.changeAmt)} ${tokLab}`;
+    if (n > DISTRIBUTE_SOFT_CAP) {
+      setNote("distributeSummaryNote",
+        msg + ` — ⚠ ${n} outputs may exceed the transaction size limit; if it fails, use a shorter list.`,
+        "warn");
+    } else {
+      setNote("distributeSummaryNote", msg, "info");
+    }
+  }
+  async function previewDistribute() {
+    const form = readDistributeForm();
+    if (!form) return;
+    const tokenid = state.selectedTokenid || "0x00";
+    const total = selectedTotal();
+    const btn = document.getElementById("distributePreviewBtn");
+    btn.disabled = true;
+    try {
+      const outputs = form.targets.map(addr => ({ address: addr, amount: form.perAddr }));
+      let change = "";
+      if (isPositive(form.changeAmt)) {
+        change = await getNextDefaultChangeAddr();
+        if (!change) throw { message: "Could not get a change address from the node." };
+      }
+      pendingPreview = {
+        mode: "distribute",
+        selectedCoins: selectedCoins(),
+        outputs,
+        change, changeAmt: form.changeAmt,
+        burn: form.burn, tokenid, total,
+      };
+      renderConfirm(pendingPreview);
+    } catch (err) {
+      setNote("distributeSummaryNote",
+        "Could not prepare distribute: " + ((err && err.message) || "see log"), "error");
+      try { MDS.log("utxoWallet.previewDistribute failed: " + JSON.stringify(err)); } catch {}
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   function setStage(name, kind) {
     const stages = document.getElementById("postingStages");
     stages.classList.add("show");
@@ -5354,6 +5604,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       toggleToolsPopover();
     });
     document.getElementById("splitItem").addEventListener("click", openSplitModal);
+    document.getElementById("distributeItem").addEventListener("click", openDistributeModal);
     document.getElementById("untrackItem").addEventListener("click", bulkUntrackSelected);
     // Split modal
     document.getElementById("splitCancelBtn").addEventListener("click", closeSplitModal);
@@ -5362,6 +5613,22 @@ body { padding-top: env(safe-area-inset-top, 0); }
     document.getElementById("splitBurnInput").addEventListener("input", updateSplitPreviewNote);
     document.getElementById("splitModal").addEventListener("click", (e) => {
       if (e.target.id === "splitModal") closeSplitModal();
+    });
+    // Distribute modal
+    document.getElementById("distributeCancelBtn").addEventListener("click", closeDistributeModal);
+    document.getElementById("distributePreviewBtn").addEventListener("click", previewDistribute);
+    for (const r of document.querySelectorAll('input[name="distributeSource"]')) {
+      r.addEventListener("change", () => {
+        const ext = document.querySelector('input[name="distributeSource"]:checked').value === "external";
+        document.getElementById("distributeListField").style.display = ext ? "" : "none";
+        updateDistributeSummary();
+      });
+    }
+    document.getElementById("distributeListInput").addEventListener("input", updateDistributeSummary);
+    document.getElementById("distributeAmountInput").addEventListener("input", updateDistributeSummary);
+    document.getElementById("distributeBurnInput").addEventListener("input", updateDistributeSummary);
+    document.getElementById("distributeModal").addEventListener("click", (e) => {
+      if (e.target.id === "distributeModal") closeDistributeModal();
     });
     // Send modal
     document.getElementById("sendCancelBtn").addEventListener("click", closeSendModal);
@@ -5421,6 +5688,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
         if (document.getElementById("receiveModal").classList.contains("open")) closeReceiveModal();
         if (document.getElementById("consolidateModal").classList.contains("open")) closeConsolidateModal();
         if (document.getElementById("splitModal").classList.contains("open")) closeSplitModal();
+        if (document.getElementById("distributeModal").classList.contains("open")) closeDistributeModal();
       }
     });
   }
