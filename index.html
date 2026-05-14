@@ -1761,7 +1761,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
     groups: new Map(),
     selected: new Set(),
     selectedTokenid: null,
-    myWalletAddresses: new Set(),
+    myWalletAddresses: new Set(),   // BOTH encodings (0x + Mx) of every wallet address — for recognition lookups
+    myWalletAddressList: [],        // canonical: ONE entry per wallet address (Mx form preferred) — for enumeration (Distribute)
     myScriptAddresses: new Set(),
     chainBlock: 0,
     activeTab: "wallet",
@@ -1793,7 +1794,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.37";
+  const UTXOWALLET_VERSION = "1.0.38";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -3043,22 +3044,39 @@ body { padding-top: env(safe-area-inset-top, 0); }
   async function loadMyAddresses() {
     const nextWallet  = new Set();
     const nextScripts = new Set();
+    // Canonical enumeration list — exactly ONE entry per wallet address. The
+    // `scripts` response carries each address in BOTH encodings (s.address is
+    // the 0x form, s.miniaddress the Mx form); nextWallet keeps both so
+    // recognition lookups (.has) match whichever form a user pastes, but
+    // enumerating that Set (e.g. Distribute "my addresses") would otherwise
+    // double-count — 64 default addresses → 128 entries. nextWalletList holds
+    // one entry per address, Mx form preferred.
+    const nextWalletList = [];
     let scResp;
     try { scResp = await mds("scripts"); }
     catch { return; /* keep previous sets on failure */ }
     const scripts = (scResp && scResp.response) || [];
     for (const s of scripts) {
+      const isDefault = DEFAULT_WALLET_SCRIPT_RE.test((s && s.script) || "");
       const addrs = [s && s.address, s && s.miniaddress].filter(Boolean);
-      const target = DEFAULT_WALLET_SCRIPT_RE.test((s && s.script) || "") ? nextWallet : nextScripts;
+      const target = isDefault ? nextWallet : nextScripts;
       for (const a of addrs) target.add(a);
+      if (isDefault) {
+        const canon = (s && s.miniaddress) || (s && s.address);
+        if (canon) nextWalletList.push(canon);
+      }
     }
     for (const c of state.coins) {
       if (c.address && !nextWallet.has(c.address) && !nextScripts.has(c.address)) {
         nextWallet.add(c.address);
+        nextWalletList.push(c.address);
       }
     }
     state.myWalletAddresses = nextWallet;
     state.myScriptAddresses = nextScripts;
+    // Dedupe defensively — a script appearing twice, or a coin address that
+    // matched a script's other encoding, must not produce a duplicate output.
+    state.myWalletAddressList = [...new Set(nextWalletList)];
   }
 
   async function refreshDefaultAddress() {
@@ -4202,7 +4220,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // Send a fixed amount to many addresses in one transaction — either every
   // wallet address this node tracks, or a pasted external list. A multi-output
   // transaction through the shared buildTransaction machinery.
-  const DISTRIBUTE_SOFT_CAP = 50;  // outputs above this risk the TxPoW size limit
+  // Minima's max TxPoW size is 64 KB (Magic.DEFAULT_TXPOW_SIZE). A MINIMA output
+  // is ~50-150 bytes, so the real ceiling is several hundred outputs; 200 leaves
+  // headroom for inputs (whose MMR proofs are far bigger) while still flagging a
+  // genuinely huge paste. The normal "distribute to all 64 default addresses"
+  // case is well under this and shouldn't trigger the warning.
+  const DISTRIBUTE_SOFT_CAP = 200;
   function closeDistributeModal() {
     const m = document.getElementById("distributeModal");
     if (m) m.classList.remove("open");
@@ -4270,7 +4293,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const sourceEl = document.querySelector('input[name="distributeSource"]:checked');
     const mode = sourceEl ? sourceEl.value : "my";
     if (mode === "my") {
-      return { addresses: [...state.myWalletAddresses], invalidCount: 0, mode };
+      // Canonical one-entry-per-address list — NOT the recognition Set, which
+      // holds both the 0x and Mx encoding of every address (enumerating that
+      // would send to each address twice).
+      return { addresses: [...(state.myWalletAddressList || [])], invalidCount: 0, mode };
     }
     // External list — split on newline / comma / whitespace, validate, dedupe.
     const raw = String(document.getElementById("distributeListInput").value || "");
