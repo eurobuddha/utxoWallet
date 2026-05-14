@@ -1684,8 +1684,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
     <div class="modal-title">Split selected coins</div>
     <div id="splitSummary" class="tx-section"></div>
     <div class="setting-desc" style="margin: 10px 0 4px;">
-      Splits your selected coins into N equal coins, each sent to one of your own default
-      addresses. Useful for breaking a large coin into spendable pieces.
+      Splits your selected coins into N coins of roughly equal value, each sent to one of your
+      own default addresses. Any remainder goes on the last coin. Useful for breaking a large
+      coin into spendable pieces — the preview below shows the exact split.
     </div>
     <div class="field">
       <div class="field-label"><span class="label">Number of coins (2–20)</span></div>
@@ -1792,7 +1793,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.35";
+  const UTXOWALLET_VERSION = "1.0.36";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -2275,8 +2276,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // truncates toward zero — equivalent to floor for the non-negative amounts
   // these wallets deal in.
   function bigDivFloor(a, intStr) {
+    const divisor = BigInt(intStr);
+    if (divisor === 0n) throw new Error("bigDivFloor: divide by zero");
     const A = _splitDec(a);
-    const bi = BigInt((A.w + A.f) || "0") / BigInt(intStr);
+    const bi = BigInt((A.w + A.f) || "0") / divisor;
     return _unscale(bi, A.f.length);
   }
 
@@ -2776,7 +2779,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
       "  `burn` varchar(64)," +
       "  `ts` bigint NOT NULL," +
       "  `note` varchar(255)," +
-      "  `inputs` clob" +
+      "  `inputs` clob," +
+      "  `outputs` clob" +
       ")"
     );
 
@@ -3281,11 +3285,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
     sendBtn.title = state.settings.nodeLocked
       ? "Node is locked (vault password not entered). Unlock the node before sending."
       : (!state.settings.writeConfirmed ? "Grant WRITE permission in Settings first." : "");
-    // Tools ▾ — needs a selection to act on; no node-lock gate here because its
-    // current actions (untrack) are local node bookkeeping, not signed txns.
+    // Tools ▾ — needs a selection to act on, AND must be gated on pendingTxId
+    // exactly like the Send button: Split / Distribute start a buildTransaction,
+    // and a second concurrent build would overwrite state.pendingTxId /
+    // state.pendingApproval and orphan the first transaction's resume.
     if (toolsBtn) {
-      toolsBtn.disabled = n === 0;
-      if (n === 0) closeToolsPopover();
+      toolsBtn.disabled = n === 0 || state.pendingTxId !== null;
+      if (toolsBtn.disabled) closeToolsPopover();
     }
   }
 
@@ -4064,6 +4070,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
   async function openSplitModal() {
     closeToolsPopover();
     if (state.selected.size === 0) return;
+    // Defense in depth — the Tools button is already disabled while a txn is
+    // in flight, but never start a second build on top of a pending one.
+    if (state.pendingTxId !== null) {
+      toast("A transaction is already in progress — wait for it to finish.", "warn");
+      return;
+    }
     // Same write + node-lock guards as openSendModal — don't walk the user
     // through a build that's guaranteed to fail at the signing step.
     if (!state.settings.writeConfirmed) {
@@ -4146,7 +4158,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const form = readSplitForm();
     if (!form) { setNote("splitPreviewNote", "", "info"); return; }
     const tokLab = tokenLabel(state.selectedTokenid || "0x00");
-    const sameLast = bigEq ? bigEq(form.each, form.lastAmount) : (form.each === form.lastAmount);
+    const sameLast = bigEq(form.each, form.lastAmount);
     const txt = sameLast
       ? `${form.n} coins of ${formatAmount(form.each)} ${tokLab} each.`
       : `${form.n - 1} coins of ${formatAmount(form.each)} ${tokLab} + 1 of ${formatAmount(form.lastAmount)} ${tokLab}.`;
@@ -4198,6 +4210,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
   async function openDistributeModal() {
     closeToolsPopover();
     if (state.selected.size === 0) return;
+    // Defense in depth — never start a second build on top of a pending one.
+    if (state.pendingTxId !== null) {
+      toast("A transaction is already in progress — wait for it to finish.", "warn");
+      return;
+    }
     if (!state.settings.writeConfirmed) {
       await probeWritePermission();
       if (!state.settings.writeConfirmed) {
@@ -4276,20 +4293,28 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const { addresses, invalidCount, mode } = getDistributeTargets();
     let ok = true;
 
+    // Single source of truth for the list note — set it exactly once.
     if (mode === "external") {
-      if (invalidCount > 0) {
+      if (!addresses.length) {
         setNote("distributeListNote",
-          `${addresses.length} valid · ${invalidCount} invalid (skipped)`, invalidCount && !addresses.length ? "error" : "warn");
+          invalidCount > 0
+            ? `No valid addresses — ${invalidCount} invalid (skipped). Paste at least one valid Mx / 0x address.`
+            : "Paste at least one valid address.",
+          "error");
+        ok = false;
+      } else if (invalidCount > 0) {
+        setNote("distributeListNote",
+          `${addresses.length} valid · ${invalidCount} invalid (skipped)`, "warn");
       } else {
-        setNote("distributeListNote", addresses.length ? `${addresses.length} valid address${addresses.length === 1 ? "" : "es"}` : "", "info");
+        setNote("distributeListNote",
+          `${addresses.length} valid address${addresses.length === 1 ? "" : "es"}`, "info");
       }
     } else {
       setNote("distributeListNote", "", "");
-    }
-    if (!addresses.length) {
-      if (mode === "external") setNote("distributeListNote", "Paste at least one valid address.", "error");
-      else setNote("distributeSummaryNote", "No wallet addresses found on this node yet.", "error");
-      ok = false;
+      if (!addresses.length) {
+        setNote("distributeSummaryNote", "No wallet addresses found on this node yet.", "error");
+        ok = false;
+      }
     }
 
     const amtRaw = String(document.getElementById("distributeAmountInput").value || "").trim();
@@ -4582,6 +4607,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // logging, the pending-rejection stash, signAndPost — is output-count-agnostic.
   async function buildTransaction(preview, onStage) {
     const { selectedCoins: sel, outputs, change, burn, tokenid, changeAmt } = preview;
+    // Load-bearing precondition — every current caller guarantees ≥1 output,
+    // but `primary` below would throw a cryptic TypeError otherwise (and only
+    // after recordHistoryPosting in some orderings). Fail fast and clearly.
+    if (!Array.isArray(outputs) || outputs.length === 0) {
+      throw { stage: "build", message: "No outputs to build." };
+    }
     const txid = "uw_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
     const tokParam = (tokenid === "0x00") ? "" : ` tokenid:${tokenid}`;
     // outputs[0] is the canonical "recipient" for history + the watcher's
