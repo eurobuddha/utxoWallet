@@ -1468,6 +1468,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
         <div class="tools-wrap">
           <button class="btn ghost small" id="toolsBtn" disabled>Tools ▾</button>
           <div class="tools-popover" id="toolsPopover" hidden>
+            <button class="tools-item" id="splitItem" type="button">Split selected…</button>
             <button class="tools-item" id="untrackItem" type="button">Untrack selected</button>
           </div>
         </div>
@@ -1656,6 +1657,33 @@ body { padding-top: env(safe-area-inset-top, 0); }
   </div>
 </div>
 
+<!-- Split modal -->
+<div class="modal-backdrop" id="splitModal">
+  <div class="modal">
+    <div class="modal-title">Split selected coins</div>
+    <div id="splitSummary" class="tx-section"></div>
+    <div class="setting-desc" style="margin: 10px 0 4px;">
+      Splits your selected coins into N equal coins, each sent to one of your own default
+      addresses. Useful for breaking a large coin into spendable pieces.
+    </div>
+    <div class="field">
+      <div class="field-label"><span class="label">Number of coins (2–20)</span></div>
+      <input type="text" id="splitCountInput" value="2" inputmode="numeric" autocomplete="off" spellcheck="false">
+      <div class="field-note" id="splitCountNote"></div>
+    </div>
+    <div class="field" id="splitBurnField">
+      <div class="field-label"><span class="label">Burn (Minima only — optional)</span></div>
+      <input type="text" id="splitBurnInput" placeholder="0" inputmode="decimal" autocomplete="off" spellcheck="false">
+      <div class="field-note" id="splitBurnNote"></div>
+    </div>
+    <div class="field-note info" id="splitPreviewNote"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="splitCancelBtn">Cancel</button>
+      <button class="btn primary" id="splitPreviewBtn">Preview →</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-stack" id="toastStack"></div>
 
 <script>
@@ -1704,7 +1732,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.33";
+  const UTXOWALLET_VERSION = "1.0.34";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -2175,6 +2203,22 @@ body { padding-top: env(safe-area-inset-top, 0); }
   function bigLte(a, b) { const x = _scaleTo(a, b); return x.biA <=  x.biB; }
   function bigEq (a, b) { const x = _scaleTo(a, b); return x.biA === x.biB; }
   function isPositive(a) { return bigGt(a, "0"); }
+  // Multiply a decimal-string amount by a non-negative INTEGER (passed as a
+  // string). Used by Split/Distribute to compute "N × per-coin amount".
+  function bigMul(a, intStr) {
+    const A = _splitDec(a);
+    const bi = BigInt((A.w + A.f) || "0") * BigInt(intStr);
+    return _unscale(bi, A.f.length);
+  }
+  // Floor-divide a non-negative decimal-string amount by a positive INTEGER
+  // (passed as a string), at the amount's own decimal precision. BigInt `/`
+  // truncates toward zero — equivalent to floor for the non-negative amounts
+  // these wallets deal in.
+  function bigDivFloor(a, intStr) {
+    const A = _splitDec(a);
+    const bi = BigInt((A.w + A.f) || "0") / BigInt(intStr);
+    return _unscale(bi, A.f.length);
+  }
 
   // ─── Validation ────────────────────────────────────────────────────
   function validateAddress(addr) {
@@ -2638,7 +2682,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // ─── DB schema + history ───────────────────────────────────────────
   // Schema migration version. Bump alongside any future ALTER step; ensureTable
   // applies only the steps whose version exceeds the last-applied marker.
-  const SCHEMA_VERSION = 4;
+  const SCHEMA_VERSION = 5;
 
   async function getSchemaVersionApplied() {
     return new Promise((resolve) => {
@@ -2710,20 +2754,28 @@ body { padding-top: env(safe-area-inset-top, 0); }
         try { MDS.log("utxoWallet.ensureTable: inputs-column migration v4: " + JSON.stringify(e)); } catch {}
       });
     }
-    // Verify the column actually exists before bumping the schema marker.
-    // If the ALTER failed for a real reason (corrupt page, disk, syntax drift),
-    // we want the next boot to retry — not silently stamp v4 and break every
-    // future INSERT against the missing column.
+    if (applied < 5) {
+      // v5 (v1.0.34): multi-output transactions (Split / Distribute). Pre-v5 rows
+      // stored only a single `recipient`/`amount`; the new `outputs` CLOB stores a
+      // JSON array of {address, amount} so the History TO section can list every
+      // recipient. Old rows have outputs=null and the renderer falls back to the
+      // single-recipient render.
+      await sql("ALTER TABLE `history` ADD COLUMN `outputs` CLOB").catch((e) => {
+        try { MDS.log("utxoWallet.ensureTable: outputs-column migration v5: " + JSON.stringify(e)); } catch {}
+      });
+    }
+    // Verify both v4+v5 columns actually exist before bumping the schema marker.
+    // If an ALTER failed for a real reason (corrupt page, disk, syntax drift),
+    // we want the next boot to retry — not silently stamp the version and break
+    // every future INSERT against the missing column.
     if (applied < SCHEMA_VERSION) {
       const cols = await sql("SHOW COLUMNS FROM `history`").catch(() => []);
-      const hasInputs = cols.some(c => {
-        const n = String(c.FIELD || c.NAME || c.COLUMN_NAME || "").toLowerCase();
-        return n === "inputs";
-      });
-      if (hasInputs) {
+      const names = new Set(cols.map(c =>
+        String(c.FIELD || c.NAME || c.COLUMN_NAME || "").toLowerCase()));
+      if (names.has("inputs") && names.has("outputs")) {
         setSchemaVersionApplied(SCHEMA_VERSION);
       } else {
-        try { MDS.log("utxoWallet.ensureTable: schema marker NOT bumped — `inputs` column missing after migration; will retry on next boot."); } catch {}
+        try { MDS.log("utxoWallet.ensureTable: schema marker NOT bumped — inputs/outputs column missing after migration; will retry on next boot."); } catch {}
       }
     }
   }
@@ -2744,8 +2796,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
       : (Array.isArray(rec.coinids) ? rec.coinids : []);
     const coinidsJson = JSON.stringify(coinidsArr);
     const inputsJson  = JSON.stringify(inputsArr);
+    // v1.0.34 schema v5: full output list for multi-output txns (Split/Distribute).
+    const outputsArr = Array.isArray(rec.outputs) ? rec.outputs : [];
+    const outputsJson = JSON.stringify(outputsArr);
     const q =
-      "INSERT INTO history (internalid, txnid, status, recipient, amount, tokenid, coinids, changeaddr, burn, ts, note, inputs) VALUES (" +
+      "INSERT INTO history (internalid, txnid, status, recipient, amount, tokenid, coinids, changeaddr, burn, ts, note, inputs, outputs) VALUES (" +
       `'${sqlQuote(rec.internalid)}', ` +
       `'${sqlQuote(rec.txnid || rec.internalid)}', ` +
       `'${sqlQuote(rec.status || "posting")}', ` +
@@ -2757,7 +2812,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
       `'${sqlQuote(rec.burn || "0")}', ` +
       `${parseInt(rec.ts, 10)}, ` +
       `'${sqlQuote(rec.note || "")}', ` +
-      `'${sqlQuote(inputsJson)}')`;
+      `'${sqlQuote(inputsJson)}', ` +
+      `'${sqlQuote(outputsJson)}')`;
     await sql(q);
     // Clip to most-recent 500
     await sql("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT 500)").catch(() => {});
@@ -3820,19 +3876,29 @@ body { padding-top: env(safe-area-inset-top, 0); }
                       ? normalizeAmount(validateBurn(document.getElementById("burnInput").value.trim()).normalized || "0")
                       : "0";
     const total = selectedTotal();
-    const isMinima = state.selectedTokenid === "0x00" || state.selectedTokenid === null;
     const changeAmt = bigSub(bigSub(total, amount), burn);
     const tokenid = state.selectedTokenid || "0x00";
 
-    pendingPreview = { selectedCoins: selectedCoins(), recipient, amount, change, burn, tokenid, changeAmt, total };
-
-    // Render confirm body
+    pendingPreview = {
+      mode: "send",
+      selectedCoins: selectedCoins(),
+      outputs: [{ address: recipient, amount }],
+      change, changeAmt, burn, tokenid, total,
+    };
+    renderConfirm(pendingPreview);
+  }
+  // Shared confirm-modal renderer for send / split / distribute. `preview.outputs`
+  // is an array of {address, amount}; the change output (if positive) and burn
+  // are appended after. Opens #confirmModal.
+  function renderConfirm(preview) {
+    const { selectedCoins: sel, outputs, change, changeAmt, burn, tokenid, total, mode } = preview;
     const body = document.getElementById("confirmBody");
     clearNode(body);
 
+    // Inputs
     body.appendChild(el("div", { class: "tx-section" },
       el("div", { class: "tx-section-label", text: "Inputs" }),
-      ...pendingPreview.selectedCoins.map(c => el("div", { class: "tx-row" },
+      ...sel.map(c => el("div", { class: "tx-row" },
         el("div", { class: "left" },
           el("span", { class: "marker", text: "•" }),
           document.createTextNode(truncMid(c.coinid, 8, 6)),
@@ -3845,22 +3911,33 @@ body { padding-top: env(safe-area-inset-top, 0); }
       ),
     ));
 
-    const outputs = [];
-    outputs.push({ addr: recipient, amt: amount, kind: "→", tag: null });
-    if (isPositive(changeAmt)) {
-      const isYours = state.myWalletAddresses.has(change);
-      outputs.push({ addr: change, amt: changeAmt, kind: "↩", tag: isYours ? { text: "yours", warn: false } : { text: "verify", warn: true } });
-    }
-    const outSection = el("div", { class: "tx-section" }, el("div", { class: "tx-section-label", text: "Outputs" }));
+    // Outputs — every entry in preview.outputs, then change, then burn.
+    const outSection = el("div", { class: "tx-section" },
+      el("div", { class: "tx-section-label",
+        text: outputs.length > 1 ? `Outputs (${outputs.length})` : "Outputs" }));
     for (const o of outputs) {
       const left = el("div", { class: "left" },
-        el("span", { class: "marker", text: o.kind }),
-        document.createTextNode(truncMid(o.addr, 10, 8)),
+        el("span", { class: "marker", text: "→" }),
+        document.createTextNode(truncMid(o.address, 10, 8)),
       );
-      if (o.tag) left.appendChild(el("span", { class: "tag " + (o.tag.warn ? "warn" : ""), text: o.tag.text }));
+      if (state.myWalletAddresses.has(o.address)) {
+        left.appendChild(el("span", { class: "tag", text: "yours" }));
+      }
       outSection.appendChild(el("div", { class: "tx-row" },
         left,
-        el("div", { class: "right", text: `${formatAmount(o.amt)} ${tokenLabel(tokenid)}` }),
+        el("div", { class: "right", text: `${formatAmount(o.amount)} ${tokenLabel(tokenid)}` }),
+      ));
+    }
+    if (isPositive(changeAmt)) {
+      const isYours = state.myWalletAddresses.has(change);
+      const left = el("div", { class: "left" },
+        el("span", { class: "marker", text: "↩" }),
+        document.createTextNode(truncMid(change, 10, 8)),
+        el("span", { class: "tag " + (isYours ? "" : "warn"), text: isYours ? "yours" : "verify" }),
+      );
+      outSection.appendChild(el("div", { class: "tx-row" },
+        left,
+        el("div", { class: "right", text: `${formatAmount(changeAmt)} ${tokenLabel(tokenid)}` }),
       ));
     }
     if (isPositive(burn)) {
@@ -3871,10 +3948,22 @@ body { padding-top: env(safe-area-inset-top, 0); }
     }
     body.appendChild(outSection);
 
+    const warnText = mode === "split"
+      ? " These coins go to your own wallet addresses."
+      : mode === "distribute"
+        ? " Verify the recipient list before continuing."
+        : " Verify the recipient address before continuing.";
     body.appendChild(el("div", { class: "tx-warn" },
       el("b", null, "Once signed and posted, this cannot be undone."),
-      document.createTextNode(" Verify the recipient address before continuing.")
+      document.createTextNode(warnText),
     ));
+
+    // Title reflects the operation.
+    const titleEl = document.querySelector("#confirmModal .modal-title");
+    if (titleEl) {
+      titleEl.textContent = mode === "split" ? "Confirm split"
+        : mode === "distribute" ? "Confirm distribute" : "Confirm transaction";
+    }
 
     // Reset stages
     const stages = document.getElementById("postingStages");
@@ -3885,15 +3974,156 @@ body { padding-top: env(safe-area-inset-top, 0); }
     document.getElementById("confirmGoBtn").disabled = false;
     document.getElementById("confirmBackBtn").disabled = false;
 
+    // Close whichever form modal is open (idempotent for the others).
     closeSendModal();
+    closeSplitModal();
+    closeDistributeModal();
     document.getElementById("confirmModal").classList.add("open");
   }
   function closeConfirmModal() {
     document.getElementById("confirmModal").classList.remove("open");
   }
-  function backToSend() {
+  // Reopen the form modal that the current preview came from.
+  function backToForm() {
     closeConfirmModal();
-    document.getElementById("sendModal").classList.add("open");
+    const mode = pendingPreview && pendingPreview.mode;
+    const id = mode === "split" ? "splitModal"
+             : mode === "distribute" ? "distributeModal" : "sendModal";
+    const m = document.getElementById(id);
+    if (m) m.classList.add("open");
+  }
+
+  // ─── Split modal ───────────────────────────────────────────────────
+  // Split the selected coins into N equal coins, each sent to one of your own
+  // rotated default addresses. A multi-output self-send through the shared
+  // buildTransaction machinery — never the bare `send` command.
+  function closeSplitModal() {
+    const m = document.getElementById("splitModal");
+    if (m) m.classList.remove("open");
+  }
+  async function openSplitModal() {
+    closeToolsPopover();
+    if (state.selected.size === 0) return;
+    // Same write + node-lock guards as openSendModal — don't walk the user
+    // through a build that's guaranteed to fail at the signing step.
+    if (!state.settings.writeConfirmed) {
+      await probeWritePermission();
+      if (!state.settings.writeConfirmed) {
+        tabSwitch("settings");
+        toast("Grant WRITE permission first.", "warn");
+        return;
+      }
+    }
+    await probeNodeLock();
+    if (state.settings.nodeLocked) {
+      tabSwitch("settings");
+      toast("Node is locked — unlock the vault password before splitting.", "error");
+      return;
+    }
+    const selected = selectedCoins();
+    const total = selectedTotal();
+    const isMinima = state.selectedTokenid === "0x00" || state.selectedTokenid === null;
+    const tokLab = tokenLabel(state.selectedTokenid || "0x00");
+
+    const summary = document.getElementById("splitSummary");
+    clearNode(summary);
+    summary.appendChild(el("div", { class: "tx-section-label", text: "Selected coins" }));
+    for (const c of selected) {
+      summary.appendChild(el("div", { class: "tx-row" },
+        el("div", { class: "left", text: truncMid(c.coinid, 8, 6) }),
+        el("div", { class: "right", text: formatAmount(coinAmt(c)) }),
+      ));
+    }
+    summary.appendChild(el("div", { class: "tx-row total" },
+      el("div", { class: "left", text: "Total" }),
+      el("div", { class: "right", text: `${formatAmount(total)} ${tokLab}` }),
+    ));
+
+    document.getElementById("splitCountInput").value = "2";
+    document.getElementById("splitBurnInput").value = "";
+    document.getElementById("splitBurnField").style.display = isMinima ? "" : "none";
+    setNote("splitCountNote", "", "");
+    setNote("splitBurnNote", "", "");
+    setNote("splitPreviewNote", "", "info");
+    document.getElementById("splitModal").classList.add("open");
+    updateSplitPreviewNote();
+  }
+  // Validate the form and return { n, burn, splittable, each, lastAmount } or null.
+  function readSplitForm() {
+    const isMinima = state.selectedTokenid === "0x00" || state.selectedTokenid === null;
+    const total = selectedTotal();
+    const nRaw = String(document.getElementById("splitCountInput").value || "").trim();
+    let ok = true;
+    const n = parseInt(nRaw, 10);
+    if (!/^[0-9]+$/.test(nRaw) || n < 2 || n > 20) {
+      setNote("splitCountNote", "Must be a whole number 2–20.", "error"); ok = false;
+    } else setNote("splitCountNote", "", "");
+    let burn = "0";
+    if (isMinima) {
+      const burnRaw = String(document.getElementById("splitBurnInput").value || "").trim() || "0";
+      const vb = validateBurn(burnRaw);
+      if (!vb.ok) { setNote("splitBurnNote", "Invalid burn amount.", "error"); ok = false; }
+      else { setNote("splitBurnNote", "", ""); burn = normalizeAmount(vb.normalized || "0"); }
+    }
+    if (!ok) return null;
+    const splittable = bigSub(total, burn);
+    if (!isPositive(splittable)) {
+      setNote("splitCountNote", "Burn leaves nothing to split.", "error");
+      return null;
+    }
+    // BigInt even split: each = floor(splittable / n); the last coin carries the
+    // remainder so the outputs sum back to exactly `splittable`.
+    const each = bigDivFloor(splittable, String(n));
+    const usedByAll = bigMul(each, String(n - 1));
+    const lastAmount = bigSub(splittable, usedByAll);
+    if (!isPositive(each)) {
+      setNote("splitCountNote", "Amount too small to split into that many coins.", "error");
+      return null;
+    }
+    return { n, burn, splittable, each, lastAmount };
+  }
+  function updateSplitPreviewNote() {
+    const form = readSplitForm();
+    if (!form) { setNote("splitPreviewNote", "", "info"); return; }
+    const tokLab = tokenLabel(state.selectedTokenid || "0x00");
+    const sameLast = bigEq ? bigEq(form.each, form.lastAmount) : (form.each === form.lastAmount);
+    const txt = sameLast
+      ? `${form.n} coins of ${formatAmount(form.each)} ${tokLab} each.`
+      : `${form.n - 1} coins of ${formatAmount(form.each)} ${tokLab} + 1 of ${formatAmount(form.lastAmount)} ${tokLab}.`;
+    setNote("splitPreviewNote", txt, "info");
+  }
+  async function previewSplit() {
+    const form = readSplitForm();
+    if (!form) return;
+    const tokenid = state.selectedTokenid || "0x00";
+    const total = selectedTotal();
+    const btn = document.getElementById("splitPreviewBtn");
+    btn.disabled = true;
+    try {
+      // N outputs to N freshly-rotated default addresses (getaddress cycles the
+      // 64 seed-derived defaults — NEVER newaddress).
+      const outputs = [];
+      for (let i = 0; i < form.n; i++) {
+        const addr = await getNextDefaultChangeAddr();
+        if (!addr) throw { message: "Could not get a default address from the node." };
+        const amount = (i === form.n - 1) ? form.lastAmount : form.each;
+        outputs.push({ address: addr, amount });
+      }
+      pendingPreview = {
+        mode: "split",
+        selectedCoins: selectedCoins(),
+        outputs,
+        change: "", changeAmt: "0",
+        burn: form.burn, tokenid, total,
+      };
+      renderConfirm(pendingPreview);
+    } catch (err) {
+      setNote("splitPreviewNote",
+        "Could not prepare split: " + ((err && err.message) || "see log"), "error");
+      try { MDS.log("utxoWallet.previewSplit failed: " + JSON.stringify(err)); } catch {}
+    } finally {
+      btn.disabled = false;
+    }
   }
   function setStage(name, kind) {
     const stages = document.getElementById("postingStages");
@@ -4096,10 +4326,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // and finish the chain in `resumePendingBuild()` on the next NEWBLOCK after the user
   // approves in MiniHub. Critically: do NOT `txndelete` on pending — that would itself
   // queue and race the original command into producing an unrecoverable mess.
+  // Staged transaction builder. `preview.outputs` is an array of {address, amount}
+  // — one entry for an ordinary send, N for Split / Distribute. The change
+  // output (if any) is emitted after all of them. Everything else — history
+  // logging, the pending-rejection stash, signAndPost — is output-count-agnostic.
   async function buildTransaction(preview, onStage) {
-    const { selectedCoins: sel, recipient, amount, change, burn, tokenid, changeAmt } = preview;
+    const { selectedCoins: sel, outputs, change, burn, tokenid, changeAmt } = preview;
     const txid = "uw_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
     const tokParam = (tokenid === "0x00") ? "" : ` tokenid:${tokenid}`;
+    // outputs[0] is the canonical "recipient" for history + the watcher's
+    // findTxpowidByOutput lookup (which scans for ANY matching output).
+    const primary = outputs[0];
     let recorded = false;
     let currentStage = "init";
     const stage = (n, k) => { currentStage = n; try { onStage && onStage(n, k); } catch {} };
@@ -4108,7 +4345,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       stage("record", "active");
       await recordHistoryPosting({
         internalid: txid, txnid: txid, status: "posting",
-        recipient, amount, tokenid,
+        recipient: primary.address, amount: primary.amount, tokenid,
         // Rich per-input record so the History row can show the FROM side
         // (which addresses we spent from) — previously only coinids survived.
         inputs: sel.map(c => ({
@@ -4119,6 +4356,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
           tokenamount: c.tokenamount != null ? String(c.tokenamount) : null,
           tokenid:     c.tokenid || "0x00",
         })),
+        // Full output list (v1.0.34 schema v5) so the History row's TO section
+        // can show every recipient for Split / Distribute, not just the first.
+        outputs: outputs.map(o => ({ address: o.address, amount: String(o.amount) })),
         // Only persist a change address when an actual change output is emitted —
         // otherwise the History row would show a misleading "CHANGE → Mx…" line
         // for funds that never moved.
@@ -4141,7 +4381,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
       stage("inputs", "done");
 
       stage("outputs", "active");
-      await mds(`txnoutput id:${txid} amount:${amount} address:${recipient}${tokParam}`);
+      for (const o of outputs) {
+        await mds(`txnoutput id:${txid} amount:${o.amount} address:${o.address}${tokParam}`);
+      }
       if (isPositive(changeAmt)) {
         await mds(`txnoutput id:${txid} amount:${changeAmt} address:${change}${tokParam}`);
       }
@@ -4175,7 +4417,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       // (extremely rare, but possible at boot), fall back to the internal
       // uw_ id and let the watcher upgrade it on the next NEWBLOCK.
       let realTxnid = await withTimeout(
-        findTxpowidByOutput(recipient, amount, tokenid, sentAtMs - 5000),
+        findTxpowidByOutput(primary.address, primary.amount, tokenid, sentAtMs - 5000),
         4000, "findTxpowidByOutput.build"
       ).catch((err) => {
         try { MDS.log("utxoWallet.build: findTxpowid timed out / failed: " + JSON.stringify(err)); } catch {}
@@ -4212,10 +4454,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
           // atBlock=0 if NEWBLOCK hasn't fired yet at boot; resumePendingBuild's expiry
           // gate skips when atBlock===0 and lazily sets it once state.chainBlock is known.
           atBlock: state.chainBlock > 0 ? state.chainBlock : 0,
+          // resumePendingBuild only re-runs signAndPost(txid, tokenid, burn) on the
+          // already-built txid — it doesn't rebuild from context, so the output list
+          // here is diagnostic only.
           context: {
-            recipient, amount, change, burn, tokenid,
+            recipient: primary.address, amount: primary.amount,
+            change, burn, tokenid,
             changeAmt: String(changeAmt),
             coinids: sel.map(c => c.coinid),
+            outputs: outputs.map(o => ({ address: o.address, amount: String(o.amount) })),
           },
         };
         if (recorded) {
@@ -4719,10 +4966,28 @@ body { padding-top: env(safe-area-inset-top, 0); }
     }
     details.appendChild(fromSection);
 
-    // TO section.
+    // TO section. v1.0.34+: multi-output txns (Split/Distribute) store the full
+    // output list — render every recipient. Pre-v5 rows have no OUTPUTS column,
+    // so fall back to the single recipient.
     const toSection = el("div", { class: "kv-section" });
-    toSection.appendChild(el("div", { class: "kv-label", text: "TO" }));
-    toSection.appendChild(addressLine(recipientAddr, {}));
+    let outs = null;
+    try { outs = JSON.parse(row.OUTPUTS || "null"); } catch {}
+    if (Array.isArray(outs) && outs.length > 1) {
+      const toLabel = el("div", { class: "kv-label" }, document.createTextNode("TO"));
+      toLabel.appendChild(el("span", { class: "kv-label-tag dim",
+        text: outs.length + " output" + (outs.length === 1 ? "" : "s") }));
+      toSection.appendChild(toLabel);
+      const list = el("div", { class: "input-list" });
+      for (const o of outs) {
+        const addr = String((o && o.address) || "");
+        if (!addr) continue;
+        list.appendChild(addressLine(addr, { amountRaw: o.amount != null ? String(o.amount) : "" }));
+      }
+      toSection.appendChild(list);
+    } else {
+      toSection.appendChild(el("div", { class: "kv-label", text: "TO" }));
+      toSection.appendChild(addressLine(recipientAddr, {}));
+    }
     details.appendChild(toSection);
 
     // CHANGE section (only if a change address was set).
@@ -5088,7 +5353,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
       ev.stopPropagation();
       toggleToolsPopover();
     });
+    document.getElementById("splitItem").addEventListener("click", openSplitModal);
     document.getElementById("untrackItem").addEventListener("click", bulkUntrackSelected);
+    // Split modal
+    document.getElementById("splitCancelBtn").addEventListener("click", closeSplitModal);
+    document.getElementById("splitPreviewBtn").addEventListener("click", previewSplit);
+    document.getElementById("splitCountInput").addEventListener("input", updateSplitPreviewNote);
+    document.getElementById("splitBurnInput").addEventListener("input", updateSplitPreviewNote);
+    document.getElementById("splitModal").addEventListener("click", (e) => {
+      if (e.target.id === "splitModal") closeSplitModal();
+    });
     // Send modal
     document.getElementById("sendCancelBtn").addEventListener("click", closeSendModal);
     document.getElementById("previewBtn").addEventListener("click", previewTx);
@@ -5106,7 +5380,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       state.lastChangeFallbackReason = null;
     });
     // Confirm modal
-    document.getElementById("confirmBackBtn").addEventListener("click", backToSend);
+    document.getElementById("confirmBackBtn").addEventListener("click", backToForm);
     document.getElementById("confirmGoBtn").addEventListener("click", confirmSend);
     // Receive
     document.getElementById("receiveCloseBtn").addEventListener("click", closeReceiveModal);
@@ -5146,6 +5420,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
         if (document.getElementById("sendModal").classList.contains("open")) closeSendModal();
         if (document.getElementById("receiveModal").classList.contains("open")) closeReceiveModal();
         if (document.getElementById("consolidateModal").classList.contains("open")) closeConsolidateModal();
+        if (document.getElementById("splitModal").classList.contains("open")) closeSplitModal();
       }
     });
   }
