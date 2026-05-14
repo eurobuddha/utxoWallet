@@ -1126,6 +1126,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
   padding-top: 12px;
   border-top: 1px dashed var(--border);
 }
+.bal-actions {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  gap: 8px;
+}
 .bal-details-summary {
   font-size: 10.5px;
   letter-spacing: 1.4px;
@@ -1610,6 +1617,45 @@ body { padding-top: env(safe-area-inset-top, 0); }
   </div>
 </div>
 
+<!-- Consolidate modal -->
+<div class="modal-backdrop" id="consolidateModal">
+  <div class="modal">
+    <div class="modal-title">Consolidate coins</div>
+    <div class="tx-section">
+      <div class="tx-section-label">Token</div>
+      <div class="tx-row"><div class="left" id="consolidateToken">—</div></div>
+    </div>
+    <div class="setting-desc" style="margin: 10px 0 4px;">
+      Merges several small UTXOs of this token into fewer, larger ones — useful for clearing dust. Needs at least 3 coins. Run a dry run first to preview.
+    </div>
+    <div class="field">
+      <div class="field-label"><span class="label">Max coins to merge (3–20)</span></div>
+      <input type="text" id="consolidateMaxCoins" value="20" inputmode="numeric" autocomplete="off" spellcheck="false">
+      <div class="field-note" id="consolidateMaxCoinsNote"></div>
+    </div>
+    <div class="field">
+      <div class="field-label"><span class="label">Min confirmations (coin age)</span></div>
+      <input type="text" id="consolidateCoinAge" value="3" inputmode="numeric" autocomplete="off" spellcheck="false">
+      <div class="field-note" id="consolidateCoinAgeNote"></div>
+    </div>
+    <div class="field" id="consolidateBurnField">
+      <div class="field-label"><span class="label">Burn (optional, MINIMA)</span></div>
+      <input type="text" id="consolidateBurn" value="0" inputmode="decimal" autocomplete="off" spellcheck="false">
+      <div class="field-note" id="consolidateBurnNote"></div>
+    </div>
+    <div class="tx-section" id="consolidateSim" hidden>
+      <div class="tx-section-label">Dry run result</div>
+      <div id="consolidateSimBody"></div>
+    </div>
+    <div class="field-note" id="consolidateStatus"></div>
+    <div class="modal-actions">
+      <button class="btn ghost" id="consolidateCancelBtn">Cancel</button>
+      <button class="btn ghost" id="consolidateDryRunBtn">Dry run</button>
+      <button class="btn primary" id="consolidateGoBtn">Consolidate</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-stack" id="toastStack"></div>
 
 <script>
@@ -1658,7 +1704,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.31";
+  const UTXOWALLET_VERSION = "1.0.32";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -3530,6 +3576,20 @@ body { padding-top: env(safe-area-inset-top, 0); }
       card.appendChild(details);
     }
 
+    // Consolidate — only meaningful with ≥3 UTXOs of this token to merge.
+    if (count >= 3) {
+      const actions = el("div", { class: "bal-actions" });
+      const conBtn = el("button", {
+        class: "btn ghost small",
+        type: "button",
+        text: "Consolidate",
+        title: `Merge ${count} ${symbol} coins into fewer, larger ones`,
+      });
+      conBtn.addEventListener("click", () => openConsolidateModal(meta.tokenid, symbol, !!isNative));
+      actions.appendChild(conBtn);
+      card.appendChild(actions);
+    }
+
     return card;
   }
 
@@ -4831,6 +4891,148 @@ body { padding-top: env(safe-area-inset-top, 0); }
     document.getElementById("receiveModal").classList.remove("open");
   }
 
+  // ─── Consolidate modal ─────────────────────────────────────────────
+  // `consolidate` is a single MDS command that merges ≥3 UTXOs of one token
+  // into fewer coins. In READ mode the one command queues one pending action
+  // — handled by the existing mds() pending path. dryrun:true simulates
+  // without posting.
+  let _consolidateCtx = null;   // { tokenid, symbol, isNative }
+  function openConsolidateModal(tokenid, symbol, isNative) {
+    _consolidateCtx = { tokenid, symbol, isNative: !!isNative };
+    document.getElementById("consolidateToken").textContent =
+      symbol + "  ·  " + truncMid(tokenid, 8, 6);
+    document.getElementById("consolidateMaxCoins").value = "20";
+    document.getElementById("consolidateCoinAge").value = "3";
+    document.getElementById("consolidateBurn").value = "0";
+    setNote("consolidateMaxCoinsNote", "", "");
+    setNote("consolidateCoinAgeNote", "", "");
+    setNote("consolidateBurnNote", "", "");
+    setNote("consolidateStatus", "", "");
+    const sim = document.getElementById("consolidateSim");
+    sim.hidden = true;
+    clearNode(document.getElementById("consolidateSimBody"));
+    // Burn only applies to native MINIMA consolidation.
+    document.getElementById("consolidateBurnField").style.display =
+      isNative ? "" : "none";
+    document.getElementById("consolidateModal").classList.add("open");
+  }
+  function closeConsolidateModal() {
+    document.getElementById("consolidateModal").classList.remove("open");
+    _consolidateCtx = null;
+  }
+  // Validate the modal's numeric fields. Returns { maxcoins, coinage, burn } or null.
+  function readConsolidateForm() {
+    const maxRaw = String(document.getElementById("consolidateMaxCoins").value || "").trim();
+    const ageRaw = String(document.getElementById("consolidateCoinAge").value || "").trim();
+    let ok = true;
+    const maxcoins = parseInt(maxRaw, 10);
+    if (!/^[0-9]+$/.test(maxRaw) || maxcoins < 3 || maxcoins > 20) {
+      setNote("consolidateMaxCoinsNote", "Must be a whole number 3–20.", "error"); ok = false;
+    } else setNote("consolidateMaxCoinsNote", "", "");
+    const coinage = parseInt(ageRaw, 10);
+    if (!/^[0-9]+$/.test(ageRaw) || coinage < 0) {
+      setNote("consolidateCoinAgeNote", "Must be a whole number ≥ 0.", "error"); ok = false;
+    } else setNote("consolidateCoinAgeNote", "", "");
+    let burn = "0";
+    if (_consolidateCtx && _consolidateCtx.isNative) {
+      const burnRaw = String(document.getElementById("consolidateBurn").value || "").trim() || "0";
+      if (!AMOUNT_RE.test(burnRaw)) {
+        setNote("consolidateBurnNote", "Invalid burn amount.", "error"); ok = false;
+      } else { setNote("consolidateBurnNote", "", ""); burn = burnRaw; }
+    }
+    if (!ok) return null;
+    return { maxcoins, coinage, burn };
+  }
+  async function runConsolidate(dryrun) {
+    if (!_consolidateCtx) return;
+    const form = readConsolidateForm();
+    if (!form) return;
+    // Real consolidations are signed writes — gate on permission + node lock.
+    if (!dryrun) {
+      if (!state.settings.writeConfirmed) {
+        setNote("consolidateStatus", "Grant WRITE permission in Settings first.", "error");
+        return;
+      }
+      if (state.settings.nodeLocked) {
+        setNote("consolidateStatus", "Node is locked — unlock the vault password before consolidating.", "error");
+        return;
+      }
+    }
+    const { tokenid, symbol } = _consolidateCtx;
+    const burnParam = (_consolidateCtx.isNative && form.burn !== "0") ? ` burn:${form.burn}` : "";
+    const cmd = `consolidate tokenid:${tokenid} coinage:${form.coinage}` +
+                ` maxcoins:${form.maxcoins} maxsigs:1${burnParam}` +
+                ` dryrun:${dryrun ? "true" : "false"}`;
+    const dryBtn = document.getElementById("consolidateDryRunBtn");
+    const goBtn = document.getElementById("consolidateGoBtn");
+    dryBtn.disabled = true; goBtn.disabled = true;
+    setNote("consolidateStatus", dryrun ? "Simulating…" : "Consolidating…", "info");
+    try {
+      const res = await mds(cmd);
+      if (dryrun) {
+        renderConsolidateSim(res);
+        setNote("consolidateStatus", "Dry run complete — review above, then Consolidate.", "ok");
+      } else {
+        toast(`Consolidate posted for ${symbol} — coins merge on the next block.`, "success");
+        closeConsolidateModal();
+        await loadCoins();
+      }
+    } catch (err) {
+      if (err && err.stage === "pending") {
+        setNote("consolidateStatus", "Queued in MiniHub Pending Actions — approve to finish.", "warn");
+        if (!dryrun) {
+          toast("Consolidate queued — approve in MiniHub Pending Actions.", "warn");
+        }
+      } else if (isLockedNodeError(err)) {
+        state.settings.nodeLocked = true;
+        renderSelectionBar(); renderSettingsPermBlock();
+        setNote("consolidateStatus", "Node is locked — unlock the vault password then retry.", "error");
+      } else {
+        const msg = (err && err.message) || (err && err.error) || "see log";
+        setNote("consolidateStatus", "Failed: " + msg, "error");
+        try { MDS.log("utxoWallet.consolidate failed: " + JSON.stringify(err)); } catch {}
+      }
+    } finally {
+      dryBtn.disabled = false; goBtn.disabled = false;
+    }
+  }
+  // Render whatever the dryrun response gives us — the shape varies between
+  // MDS builds, so probe the common txn paths and fall back to a count.
+  function renderConsolidateSim(res) {
+    const body = document.getElementById("consolidateSimBody");
+    clearNode(body);
+    const r = (res && res.response) || {};
+    // Try the documented txn shapes for input/output counts.
+    const txn = r.txn || (r.body && r.body.txn) || r.transaction || null;
+    let inputs = null, outputs = null;
+    if (txn) {
+      inputs = Array.isArray(txn.inputs) ? txn.inputs.length : null;
+      outputs = Array.isArray(txn.outputs) ? txn.outputs.length : null;
+    }
+    if (inputs == null && Array.isArray(r.inputs)) inputs = r.inputs.length;
+    if (outputs == null && Array.isArray(r.outputs)) outputs = r.outputs.length;
+    const rows = [];
+    if (inputs != null) rows.push(["Coins merged", String(inputs)]);
+    if (outputs != null) rows.push(["Resulting coins", String(outputs)]);
+    const size = r.size || (txn && txn.size);
+    if (size) rows.push(["Transaction size", String(size) + " bytes"]);
+    const burn = r.burn || (txn && txn.burn);
+    if (burn != null && String(burn) !== "0") rows.push(["Burn", String(burn) + " MINIMA"]);
+    if (rows.length) {
+      for (const [k, v] of rows) {
+        body.appendChild(el("div", { class: "tx-row" },
+          el("div", { class: "left", text: k }),
+          el("div", { class: "right", text: v }),
+        ));
+      }
+    } else {
+      // Couldn't parse the shape — show that the simulation at least succeeded.
+      body.appendChild(el("div", { class: "tx-row" },
+        el("div", { class: "left", text: "Simulation OK — node accepted the consolidation." })));
+      try { MDS.log("utxoWallet.consolidate dryrun shape: " + JSON.stringify(res).slice(0, 500)); } catch {}
+    }
+  }
+
   // ─── Wiring ────────────────────────────────────────────────────────
   function wire() {
     // Tabs
@@ -4883,6 +5085,13 @@ body { padding-top: env(safe-area-inset-top, 0); }
     document.getElementById("trackCoinInput").addEventListener("keydown", (e) => {
       if (e.key === "Enter") trackCoinById();
     });
+    // Consolidate modal
+    document.getElementById("consolidateCancelBtn").addEventListener("click", closeConsolidateModal);
+    document.getElementById("consolidateDryRunBtn").addEventListener("click", () => runConsolidate(true));
+    document.getElementById("consolidateGoBtn").addEventListener("click", () => runConsolidate(false));
+    document.getElementById("consolidateModal").addEventListener("click", (e) => {
+      if (e.target.id === "consolidateModal") closeConsolidateModal();
+    });
     // Backdrop click to close
     document.getElementById("sendModal").addEventListener("click", (e) => {
       if (e.target.id === "sendModal") closeSendModal();
@@ -4895,6 +5104,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       if (e.key === "Escape") {
         if (document.getElementById("sendModal").classList.contains("open")) closeSendModal();
         if (document.getElementById("receiveModal").classList.contains("open")) closeReceiveModal();
+        if (document.getElementById("consolidateModal").classList.contains("open")) closeConsolidateModal();
       }
     });
   }
