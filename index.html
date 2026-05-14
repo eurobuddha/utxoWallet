@@ -1686,7 +1686,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
     <div class="setting-desc" style="margin: 10px 0 4px;">
       Splits your selected coins into N coins of roughly equal value, each sent to one of your
       own default addresses. Any remainder goes on the last coin. Useful for breaking a large
-      coin into spendable pieces — the preview below shows the exact split.
+      coin into spendable pieces — the preview below shows the exact split. The whole split is
+      one transaction, so it must fit Minima's 64 KB size limit (you'll be told before posting
+      if it doesn't).
     </div>
     <div class="field">
       <div class="field-label"><span class="label">Number of coins (2–20)</span></div>
@@ -1713,7 +1715,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
     <div id="distributeSummary" class="tx-section"></div>
     <div class="setting-desc" style="margin: 10px 0 4px;">
       Sends a fixed amount to many addresses in one transaction — to all of your own wallet
-      addresses, or to a list you paste in. Any remainder returns to you as change.
+      addresses, or to a list you paste in. Any remainder returns to you as change. It's a
+      single transaction, so a very large list may not fit Minima's 64 KB size limit — if so
+      you'll be told before posting and can use a shorter list.
     </div>
     <div class="field">
       <div class="field-label"><span class="label">Send to</span></div>
@@ -1794,7 +1798,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.38";
+  const UTXOWALLET_VERSION = "1.0.39";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -4187,6 +4191,14 @@ body { padding-top: env(safe-area-inset-top, 0); }
     if (!form) return;
     const tokenid = state.selectedTokenid || "0x00";
     const total = selectedTotal();
+    // Pre-build size guard — refuse rather than waste a post the chain rejects.
+    const estBytes = estimateTxPowBytes(state.selected.size, form.n);
+    if (estBytes > MINIMA_MAX_TXPOW_BYTES) {
+      setNote("splitCountNote",
+        "Too large for one transaction (~" + (estBytes / 1024).toFixed(0) + " KB est., 64 KB limit). " +
+        "Split into fewer coins, or select fewer input coins.", "error");
+      return;
+    }
     const btn = document.getElementById("splitPreviewBtn");
     btn.disabled = true;
     try {
@@ -4219,13 +4231,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // ─── Distribute modal ──────────────────────────────────────────────
   // Send a fixed amount to many addresses in one transaction — either every
   // wallet address this node tracks, or a pasted external list. A multi-output
-  // transaction through the shared buildTransaction machinery.
-  // Minima's max TxPoW size is 64 KB (Magic.DEFAULT_TXPOW_SIZE). A MINIMA output
-  // is ~50-150 bytes, so the real ceiling is several hundred outputs; 200 leaves
-  // headroom for inputs (whose MMR proofs are far bigger) while still flagging a
-  // genuinely huge paste. The normal "distribute to all 64 default addresses"
-  // case is well under this and shouldn't trigger the warning.
-  const DISTRIBUTE_SOFT_CAP = 200;
+  // transaction through the shared buildTransaction machinery. The cap on how
+  // many addresses fit is the 64 KB TxPoW size limit, checked via
+  // estimateTxPowBytes() at preview and oversizedPostError() after posting —
+  // not a magic count.
   function closeDistributeModal() {
     const m = document.getElementById("distributeModal");
     if (m) m.classList.remove("open");
@@ -4393,9 +4402,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
     let msg = `${n} address${n === 1 ? "" : "es"} × ${formatAmount(form.perAddr)} = ${formatAmount(totalOut)} ${tokLab}`;
     if (isPositive(form.burn)) msg += ` · burn ${formatAmount(form.burn)}`;
     if (isPositive(form.changeAmt)) msg += ` · change ${formatAmount(form.changeAmt)} ${tokLab}`;
-    if (n > DISTRIBUTE_SOFT_CAP) {
+    // Size-based guard, not a magic count: estimate the TxPoW bytes (each
+    // target = one output, +1 for change) against Minima's 64 KB limit.
+    const outCount = n + (isPositive(form.changeAmt) ? 1 : 0);
+    const estBytes = estimateTxPowBytes(state.selected.size, outCount);
+    if (estBytes > MINIMA_MAX_TXPOW_BYTES) {
       setNote("distributeSummaryNote",
-        msg + ` — ⚠ ${n} outputs may exceed the transaction size limit; if it fails, use a shorter list.`,
+        msg + ` — ✗ ~${(estBytes / 1024).toFixed(0)} KB est. exceeds Minima's 64 KB transaction limit. Use a shorter list.`,
+        "error");
+    } else if (estBytes > MINIMA_MAX_TXPOW_BYTES * 0.8) {
+      setNote("distributeSummaryNote",
+        msg + ` — ⚠ large (~${(estBytes / 1024).toFixed(0)} KB est.); close to the 64 KB transaction limit.`,
         "warn");
     } else {
       setNote("distributeSummaryNote", msg, "info");
@@ -4406,6 +4423,18 @@ body { padding-top: env(safe-area-inset-top, 0); }
     if (!form) return;
     const tokenid = state.selectedTokenid || "0x00";
     const total = selectedTotal();
+    // Pre-build size guard — block rather than waste a post the chain rejects.
+    const outCount = form.targets.length + (isPositive(form.changeAmt) ? 1 : 0);
+    const estBytes = estimateTxPowBytes(state.selected.size, outCount);
+    if (estBytes > MINIMA_MAX_TXPOW_BYTES) {
+      const suggested = Math.max(1, Math.floor(
+        (MINIMA_MAX_TXPOW_BYTES - estimateTxPowBytes(state.selected.size, 0)) /
+        ((estBytes - estimateTxPowBytes(state.selected.size, 0)) / outCount)));
+      setNote("distributeSummaryNote",
+        `Too large for one transaction (~${(estBytes / 1024).toFixed(0)} KB est., 64 KB limit). ` +
+        `Use an external list of about ${suggested} addresses or fewer.`, "error");
+      return;
+    }
     const btn = document.getElementById("distributePreviewBtn");
     btn.disabled = true;
     try {
@@ -4506,6 +4535,54 @@ body { padding-top: env(safe-area-inset-top, 0); }
   function signAndPost(txid, tokenid, burn) {
     const burnParam = (tokenid === "0x00" && isPositive(burn || "0")) ? ` txnpostburn:${burn}` : "";
     return mds(`txnsign id:${txid} publickey:auto txnpostauto:true txndelete:true${burnParam}`);
+  }
+  // Minima's max TxPoW size. Magic.DEFAULT_TXPOW_SIZE = 64*1024. A TxPoW over
+  // this is rejected at full validation (TxPoWChecker.checkFullTxPoW) — but
+  // NOT by `txnpost`/`txnsign txnpostauto` (which post fire-and-forget to the
+  // async miner) and NOT by `txncheck`. So an oversized multi-output txn gets
+  // a success-shaped response and silently never lands. We catch it ourselves.
+  const MINIMA_MAX_TXPOW_BYTES = 64 * 1024;
+  // Pull the posted TxPoW's byte size out of a `txnsign txnpostauto:true`
+  // response. TxPoW.toJSON() includes a `size` field. Returns a number, or
+  // null if the shape doesn't expose it (then we can't validate — fall back
+  // to the watcher).
+  function postedTxPowSize(post) {
+    const r = (post && post.response) || {};
+    const tp = r.txpow || (post && post.txpow) || null;
+    const raw = (tp && tp.size != null) ? tp.size : (r.size != null ? r.size : null);
+    if (raw == null) return null;
+    const n = parseInt(raw, 10);
+    return Number.isFinite(n) ? n : null;
+  }
+  // Conservative pre-build estimate of a TxPoW's byte size, so Distribute /
+  // Split can warn or block BEFORE wasting a (harmless but pointless) post.
+  // Deliberately generous — inputs carry MMR proofs + signatures (the big
+  // contributors) and outputs each carry an address + amount + token + state
+  // flag. Calibrate against the real `posted TxPoW size` logs over time.
+  function estimateTxPowBytes(inputCount, outputCount) {
+    const FIXED_OVERHEAD   = 2048;   // header, txn/witness scaffolding
+    const PER_INPUT_BYTES  = 3072;   // input coin + MMR proof + signature share
+    const PER_OUTPUT_BYTES = 320;    // output coin: address + amount + tokenid + storestate
+    return FIXED_OVERHEAD
+         + PER_INPUT_BYTES  * Math.max(0, inputCount | 0)
+         + PER_OUTPUT_BYTES * Math.max(0, outputCount | 0);
+  }
+  // Shared post-size guard for buildTransaction + resumePendingBuild. Logs the
+  // real size for every send (diagnostic), and returns an error string when the
+  // posted TxPoW is over Minima's limit — meaning it will never land and the
+  // caller must NOT mark the row `posted`. Returns null when the size is fine
+  // or unavailable.
+  function oversizedPostError(post, outputCount) {
+    const size = postedTxPowSize(post);
+    try { MDS.log("utxoWallet.build: posted TxPoW size = " + (size == null ? "unknown" : size + " bytes")); } catch {}
+    if (size == null || size <= MINIMA_MAX_TXPOW_BYTES) return null;
+    const kb = (size / 1024).toFixed(1);
+    let msg = "Transaction too large: " + kb + " KB exceeds Minima's 64 KB limit — it will not be mined.";
+    if (outputCount > 1) {
+      const suggested = Math.max(1, Math.floor(outputCount * MINIMA_MAX_TXPOW_BYTES / size));
+      msg += " This had " + outputCount + " outputs; retry with about " + suggested + " or fewer.";
+    }
+    return msg;
   }
   // Scans the local node's `history` for a recent TxPoW whose outputs include
   // our recipient with the right amount + tokenid in a timestamp window
@@ -4717,6 +4794,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
       stage("basics", "done");
       stage("check", "done");
       stage("post", "done");
+
+      // `txnsign txnpostauto:true` posts fire-and-forget to the async miner and
+      // returns success even for a TxPoW the chain will reject for being over
+      // the 64 KB limit. Read the real size from the response and fail NOW —
+      // honestly, with the numbers — instead of marking the row `posted` and
+      // leaving the watcher to discover it 5 minutes later. The oversized TxPoW
+      // already handed to the miner is harmless: nothing moved, inputs stay.
+      // Thrown to the catch below, which marks the row `error` with this message.
+      const oversizeMsg = oversizedPostError(post, outputs.length);
+      if (oversizeMsg) throw { stage: "toolarge", message: oversizeMsg, txid };
 
       // Local-history scan is the CANONICAL source of the on-chain txpowid.
       // extractRealTxnid's regex-validated pluck from the txnsign response
@@ -4943,6 +5030,19 @@ body { padding-top: env(safe-area-inset-top, 0); }
       // - Hard failure: NO txndelete (orphan waits for the sweeper in WRITE mode).
       try {
         const post = await signAndPost(pa.txid, pa.context.tokenid, pa.context.burn || "0");
+        // Same oversized-TxPoW guard as buildTransaction — a too-large txn comes
+        // back success-shaped but never lands. Fail the row honestly now.
+        const ctxOutputs = (pa.context && Array.isArray(pa.context.outputs)) ? pa.context.outputs.length : 1;
+        const oversizeMsg = oversizedPostError(post, ctxOutputs);
+        if (oversizeMsg) {
+          await markHistoryStatus(pa.internalid, "error", oversizeMsg).catch(()=>{});
+          state.pendingApproval = null;
+          if (state.pendingTxId === pa.txid) state.pendingTxId = null;
+          toast(oversizeMsg, "error");
+          if (state.activeTab === "history") loadHistory();
+          renderSelectionBar();
+          return;
+        }
         const realTxnid = extractRealTxnid(post, pa.txid);
         await finalizeHistoryPosted(pa.internalid, realTxnid).catch(()=>{});
         state.pendingApproval = null;
