@@ -379,6 +379,39 @@ body { padding-top: env(safe-area-inset-top, 0); }
 .sb-total .tok { font-size: 11px; color: var(--accent); margin-left: 4px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.2px; }
 .sb-actions { display: flex; gap: 8px; }
 
+/* ── Tools popover (selection-bar) ─────────────────────────────────── */
+.tools-wrap { position: relative; }
+.tools-popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  min-width: 168px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 5px;
+  z-index: 60;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tools-popover[hidden] { display: none; }
+.tools-item {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.tools-item:hover { background: var(--surface3); color: var(--heading); }
+.tools-item.danger:hover { color: var(--red); }
+
 /* ── Buttons ───────────────────────────────────────────────────────── */
 .btn {
   padding: 10px 16px;
@@ -1425,6 +1458,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
       </div>
       <div class="sb-actions">
         <button class="btn ghost small" id="clearBtn" disabled>Clear</button>
+        <div class="tools-wrap">
+          <button class="btn ghost small" id="toolsBtn" disabled>Tools ▾</button>
+          <div class="tools-popover" id="toolsPopover" hidden>
+            <button class="tools-item" id="untrackItem" type="button">Untrack selected</button>
+          </div>
+        </div>
         <button class="btn primary small" id="sendBtn" disabled>Send →</button>
       </div>
     </div>
@@ -1473,6 +1512,19 @@ body { padding-top: env(safe-area-inset-top, 0); }
           <div class="label" id="lockLabel">Checking…</div>
           <button class="btn small ghost" id="retestLockBtn">Re-check</button>
         </div>
+      </div>
+
+      <div class="setting-block">
+        <div class="setting-title">Track a coin</div>
+        <div class="setting-desc">
+          Paste a coinid to start tracking it on this node. Untracked coins (Wallet → select → Tools ▾ → Untrack) drop out of the wallet view — re-track them here. This affects what the node tracks, not the chain.
+        </div>
+        <div class="field">
+          <div class="field-label"><span class="label">Coin ID</span></div>
+          <input type="text" id="trackCoinInput" placeholder="0x…" autocomplete="off" spellcheck="false">
+          <div class="field-note" id="trackCoinNote"></div>
+        </div>
+        <button class="btn small ghost" id="trackCoinBtn">Track</button>
       </div>
 
       <div class="setting-block">
@@ -1606,7 +1658,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.30";
+  const UTXOWALLET_VERSION = "1.0.31";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -3041,6 +3093,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const tot = document.getElementById("sbTotal");
     const clearBtn = document.getElementById("clearBtn");
     const sendBtn  = document.getElementById("sendBtn");
+    const toolsBtn = document.getElementById("toolsBtn");
     const n = state.selected.size;
     if (n === 0) {
       sb.classList.remove("has-selection");
@@ -3066,6 +3119,112 @@ body { padding-top: env(safe-area-inset-top, 0); }
     sendBtn.title = state.settings.nodeLocked
       ? "Node is locked (vault password not entered). Unlock the node before sending."
       : (!state.settings.writeConfirmed ? "Grant WRITE permission in Settings first." : "");
+    // Tools ▾ — needs a selection to act on; no node-lock gate here because its
+    // current actions (untrack) are local node bookkeeping, not signed txns.
+    if (toolsBtn) {
+      toolsBtn.disabled = n === 0;
+      if (n === 0) closeToolsPopover();
+    }
+  }
+
+  // ─── Tools popover ─────────────────────────────────────────────────
+  let _toolsOutsideHandler = null;
+  function closeToolsPopover() {
+    const pop = document.getElementById("toolsPopover");
+    if (pop) pop.hidden = true;
+    if (_toolsOutsideHandler) {
+      document.removeEventListener("mousedown", _toolsOutsideHandler, true);
+      document.removeEventListener("keydown", _toolsOutsideHandler, true);
+      _toolsOutsideHandler = null;
+    }
+  }
+  function toggleToolsPopover() {
+    const pop = document.getElementById("toolsPopover");
+    const btn = document.getElementById("toolsBtn");
+    if (!pop || !btn) return;
+    if (!pop.hidden) { closeToolsPopover(); return; }
+    pop.hidden = false;
+    // One-shot listener: any click outside the popover/button, or Escape, closes it.
+    _toolsOutsideHandler = (ev) => {
+      if (ev.type === "keydown" && ev.key !== "Escape") return;
+      if (ev.type === "mousedown" && (pop.contains(ev.target) || btn.contains(ev.target))) return;
+      closeToolsPopover();
+    };
+    document.addEventListener("mousedown", _toolsOutsideHandler, true);
+    document.addEventListener("keydown", _toolsOutsideHandler, true);
+  }
+
+  // ─── Bulk untrack ──────────────────────────────────────────────────
+  // `cointrack enable:false` per selected coin. Untracked coins drop out of
+  // `coins relevant:true` — they vanish from the wallet view. Re-tracking
+  // requires the coinid (Settings → Track a coin), so confirm first.
+  async function bulkUntrackSelected() {
+    closeToolsPopover();
+    const coins = selectedCoins();
+    if (!coins.length) return;
+    if (!state.settings.writeConfirmed) {
+      tabSwitch("settings");
+      toast("Grant WRITE permission first.", "warn");
+      return;
+    }
+    const n = coins.length;
+    const ok = window.confirm(
+      `Untrack ${n} coin${n > 1 ? "s" : ""}?\n\n` +
+      "They will disappear from the wallet view. To get them back you'll need " +
+      "to re-track each coinid in Settings → Track a coin."
+    );
+    if (!ok) return;
+    let done = 0, failed = 0, pending = 0;
+    for (const c of coins) {
+      try {
+        await mds(`cointrack enable:false coinid:${c.coinid}`);
+        done++;
+      } catch (err) {
+        if (err && err.stage === "pending") { pending++; }
+        else { failed++; try { MDS.log("utxoWallet.untrack failed " + c.coinid + ": " + JSON.stringify(err)); } catch {} }
+      }
+    }
+    onClearSelection();
+    await loadCoins();
+    if (pending) {
+      toast(`${pending} untrack action${pending > 1 ? "s" : ""} queued in MiniHub — approve to finish.`, "warn");
+    } else if (failed) {
+      toast(`Untracked ${done}, ${failed} failed — see log.`, failed === n ? "error" : "warn");
+    } else {
+      toast(`Untracked ${done} coin${done > 1 ? "s" : ""}.`, "success");
+    }
+  }
+
+  // ─── Track a coin by coinid ────────────────────────────────────────
+  async function trackCoinById() {
+    const input = document.getElementById("trackCoinInput");
+    if (!input) return;
+    const coinid = String(input.value || "").trim();
+    if (!/^0x[0-9a-fA-F]+$/.test(coinid)) {
+      setNote("trackCoinNote", "Enter a valid coinid (0x followed by hex).", "error");
+      return;
+    }
+    if (!state.settings.writeConfirmed) {
+      setNote("trackCoinNote", "Grant WRITE permission first (above).", "error");
+      return;
+    }
+    const btn = document.getElementById("trackCoinBtn");
+    if (btn) btn.disabled = true;
+    try {
+      await mds(`cointrack enable:true coinid:${coinid}`);
+      await loadCoins();
+      input.value = "";
+      setNote("trackCoinNote", "Coin tracked — it will appear in the wallet view if it's yours.", "ok");
+    } catch (err) {
+      if (err && err.stage === "pending") {
+        setNote("trackCoinNote", "Queued in MiniHub Pending Actions — approve to finish.", "warn");
+      } else {
+        setNote("trackCoinNote", "Track failed: " + ((err && err.message) || (err && err.error) || "see log"), "error");
+        try { MDS.log("utxoWallet.track failed " + coinid + ": " + JSON.stringify(err)); } catch {}
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   // ─── Balances tab ──────────────────────────────────────────────────
@@ -4681,6 +4840,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
     // Selection bar
     document.getElementById("clearBtn").addEventListener("click", onClearSelection);
     document.getElementById("sendBtn").addEventListener("click", openSendModal);
+    // Tools ▾ popover
+    document.getElementById("toolsBtn").addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      toggleToolsPopover();
+    });
+    document.getElementById("untrackItem").addEventListener("click", bulkUntrackSelected);
     // Send modal
     document.getElementById("sendCancelBtn").addEventListener("click", closeSendModal);
     document.getElementById("previewBtn").addEventListener("click", previewTx);
@@ -4712,6 +4877,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
       const btn = document.getElementById("retestLockBtn");
       btn.disabled = true;
       try { await probeNodeLock(); } finally { btn.disabled = false; }
+    });
+    // Settings — track a coin
+    document.getElementById("trackCoinBtn").addEventListener("click", trackCoinById);
+    document.getElementById("trackCoinInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") trackCoinById();
     });
     // Backdrop click to close
     document.getElementById("sendModal").addEventListener("click", (e) => {
