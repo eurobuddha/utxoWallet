@@ -1736,18 +1736,24 @@ body { padding-top: env(safe-area-inset-top, 0); }
     <div class="modal-title">Distribute selected coins</div>
     <div id="distributeSummary" class="tx-section"></div>
     <div class="setting-desc" style="margin: 10px 0 4px;">
-      Sends a fixed amount to many addresses — to all of your own wallet addresses, or to a
-      list you paste in. Minima won't relay a transaction with more than 15 output coins, so a
-      longer list is delivered as an auto-chained sequence: you confirm once, and the wallet
-      posts ~14-address batches one after another (each spends the previous batch's change)
-      until every address is covered. Keep this node online until it finishes.
+      Sends a fixed amount to many addresses — to a chosen number of your own wallet
+      addresses, or to a list you paste in. Minima won't relay a transaction with more than 15
+      output coins, so a longer list is delivered as an auto-chained sequence: you confirm
+      once, and the wallet posts ~14-address batches one after another (each spends the
+      previous batch's change) until every address is covered. Keep this node online until it
+      finishes.
     </div>
     <div class="field">
       <div class="field-label"><span class="label">Send to</span></div>
       <label class="radio-row"><input type="radio" name="distributeSource" value="my" checked>
-        <div class="text"><div class="head">My wallet addresses</div><div class="sub">Every default address this node tracks. Spreads coins across your own wallet.</div></div></label>
+        <div class="text"><div class="head">My wallet addresses</div><div class="sub">Spread coins across a chosen number of your own default addresses.</div></div></label>
       <label class="radio-row"><input type="radio" name="distributeSource" value="external">
         <div class="text"><div class="head">External list</div><div class="sub">Paste Mx / 0x addresses below — one per line, or comma / space separated.</div></div></label>
+    </div>
+    <div class="field" id="distributeCountField">
+      <div class="field-label"><span class="label">How many addresses</span></div>
+      <input type="number" id="distributeCountInput" min="2" max="64" step="1" inputmode="numeric" autocomplete="off" spellcheck="false">
+      <div class="field-note" id="distributeCountNote"></div>
     </div>
     <div class="field" id="distributeListField" style="display:none">
       <div class="field-label"><span class="label">Addresses</span></div>
@@ -1868,7 +1874,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.43";
+  const UTXOWALLET_VERSION = "1.0.44";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -4485,6 +4491,14 @@ body { padding-top: env(safe-area-inset-top, 0); }
     for (const r of document.querySelectorAll('input[name="distributeSource"]')) {
       r.checked = (r.value === "my");
     }
+    // "My wallet addresses" mode shows a count picker (2..available). Default to
+    // all available addresses, so the out-of-the-box behaviour is unchanged.
+    const addrMax = Math.max(2, (state.myWalletAddressList || []).length || 2);
+    const countInput = document.getElementById("distributeCountInput");
+    countInput.max = String(addrMax);
+    countInput.value = String(addrMax);
+    document.getElementById("distributeCountField").style.display = "";
+    setNote("distributeCountNote", "", "");
     document.getElementById("distributeListField").style.display = "none";
     document.getElementById("distributeListInput").value = "";
     document.getElementById("distributeAmountInput").value = "";
@@ -4507,7 +4521,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
       // Canonical one-entry-per-address list — NOT the recognition Set, which
       // holds both the 0x and Mx encoding of every address (enumerating that
       // would send to each address twice).
-      return { addresses: [...(state.myWalletAddressList || [])], invalidCount: 0, mode };
+      const full = [...(state.myWalletAddressList || [])];
+      const countMax = full.length;
+      // User-chosen count (2..countMax). A blank / NaN / out-of-range value is
+      // flagged by readDistributeForm; here we just clamp to a usable slice.
+      const countRaw = parseInt(document.getElementById("distributeCountInput").value, 10);
+      let count = Number.isFinite(countRaw) ? countRaw : countMax;
+      if (count < 2) count = 2;
+      if (count > countMax) count = countMax;
+      return { addresses: full.slice(0, count), invalidCount: 0, mode, countRaw, countMax };
     }
     // External list — split on newline / comma / whitespace, validate, dedupe.
     const raw = String(document.getElementById("distributeListInput").value || "");
@@ -4530,7 +4552,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
   function readDistributeForm() {
     const isMinima = state.selectedTokenid === "0x00" || state.selectedTokenid === null;
     const total = selectedTotal();
-    const { addresses, invalidCount, mode } = getDistributeTargets();
+    const { addresses, invalidCount, mode, countRaw, countMax } = getDistributeTargets();
     let ok = true;
 
     // Single source of truth for the list note — set it exactly once.
@@ -4551,9 +4573,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
       }
     } else {
       setNote("distributeListNote", "", "");
-      if (!addresses.length) {
+      if (!countMax) {
         setNote("distributeSummaryNote", "No wallet addresses found on this node yet.", "error");
         ok = false;
+      } else if (!Number.isFinite(countRaw) || countRaw < 2) {
+        setNote("distributeCountNote", `Choose a number of addresses between 2 and ${countMax}.`, "error");
+        ok = false;
+      } else if (countRaw > countMax) {
+        setNote("distributeCountNote",
+          `Only ${countMax} wallet addresses available — distributing to all ${countMax}.`, "info");
+      } else {
+        setNote("distributeCountNote", "", "");
       }
     }
 
@@ -6335,9 +6365,11 @@ body { padding-top: env(safe-area-inset-top, 0); }
       r.addEventListener("change", () => {
         const ext = document.querySelector('input[name="distributeSource"]:checked').value === "external";
         document.getElementById("distributeListField").style.display = ext ? "" : "none";
+        document.getElementById("distributeCountField").style.display = ext ? "none" : "";
         updateDistributeSummary();
       });
     }
+    document.getElementById("distributeCountInput").addEventListener("input", updateDistributeSummary);
     document.getElementById("distributeListInput").addEventListener("input", updateDistributeSummary);
     document.getElementById("distributeAmountInput").addEventListener("input", updateDistributeSummary);
     document.getElementById("distributeBurnInput").addEventListener("input", updateDistributeSummary);
