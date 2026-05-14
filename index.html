@@ -36,6 +36,36 @@
   --nav-h: 52px;
 }
 
+/* Dark theme — the photo-negative of the light palette (bg↔ink, hard rule
+   black↔near-white, pale tints → dark tints). The signal-orange accent is the
+   one constant — it carries the identity and reads on both. Toggled by setting
+   data-theme="dark" on <html>; every component is var-driven so this flips the
+   whole app. */
+:root[data-theme="dark"] {
+  --bg: #000000;
+  --surface: #0d0d0f;
+  --surface2: #18181b;
+  --surface3: #242428;
+  --border: #f0f0f0;
+  --border2: #383840;
+  --accent: #ff5a1f;
+  --accent2: #ff7847;
+  --accent-glow: #1f0f06;
+  --accent-soft: #2e1408;
+  --text: #d6d6d6;
+  --dim: #8e8e8e;
+  --dim2: #5a5a5a;
+  --heading: #f5f5f5;
+  --red: #ff5b5b;
+  --red-soft: #2a0d0d;
+  --red-border: #ff5b5b;
+  --amber: #e0a93a;
+  --amber-soft: #2a2008;
+  --amber-border: #e0a93a;
+  --blue: #6f9bff;
+  --blue-soft: #11193a;
+}
+
 * { margin: 0; padding: 0; box-sizing: border-box; border-radius: 0; }
 
 html, body {
@@ -80,6 +110,21 @@ a { color: var(--accent); }
   background: var(--accent);
   animation: pulse 1.6s steps(1, end) infinite;
 }
+.nav-right { display: flex; align-items: center; gap: 10px; }
+.theme-toggle {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  cursor: pointer;
+  transition: background 0.08s, color 0.08s;
+}
+.theme-toggle:hover { background: var(--heading); color: var(--bg); }
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0; }
@@ -1436,9 +1481,12 @@ a { color: var(--accent); }
       <div class="s">pick your coins</div>
     </div>
   </div>
-  <div class="nav-block">
-    <span class="dot"></span>
-    <span id="blockNo">—</span>
+  <div class="nav-right">
+    <button class="theme-toggle" id="themeToggle" type="button" title="Switch theme">Dark</button>
+    <div class="nav-block">
+      <span class="dot"></span>
+      <span id="blockNo">—</span>
+    </div>
   </div>
 </div>
 
@@ -1795,6 +1843,9 @@ a { color: var(--accent); }
     lastBlockAt: 0,
     chainTipAgeMs: 0,
     chainTipProbedAt: 0,
+    // "light" | "dark" — persisted via MDS.keypair, applied as a data-theme
+    // attribute on <html>. Defaults to light (the v1.0.45 Mono Brutalist look).
+    theme: "light",
   };
   const RESUME_THROTTLE_BLOCKS = 2;
   // Minima's MAX_RELAY_OUTPUTCOINS — a txn with more output coins than this is
@@ -1826,7 +1877,7 @@ a { color: var(--accent); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.45";
+  const UTXOWALLET_VERSION = "1.0.46";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -4811,6 +4862,37 @@ a { color: var(--accent); }
   function saveSizeModel() {
     try { MDS.keypair.set("utxoWallet.sizeModel", JSON.stringify(_sizeModel), () => {}); } catch {}
   }
+  // ─── Theme (light / dark) ──────────────────────────────────────────
+  // The whole UI is CSS-variable driven, so a theme is just a data-theme
+  // attribute on <html> that swaps the token block. Persisted via MDS.keypair.
+  function loadTheme() {
+    return new Promise((resolve) => {
+      try {
+        MDS.keypair.get("utxoWallet.theme", (res) => {
+          const v = res && res.value;
+          if (v === "dark" || v === "light") state.theme = v;
+          resolve();
+        });
+      } catch { resolve(); }
+    });
+  }
+  function saveTheme() {
+    try { MDS.keypair.set("utxoWallet.theme", state.theme, () => {}); } catch {}
+  }
+  function applyTheme() {
+    document.documentElement.setAttribute("data-theme", state.theme === "dark" ? "dark" : "light");
+    const btn = document.getElementById("themeToggle");
+    if (btn) {
+      // Label names the mode the click switches TO.
+      btn.textContent = state.theme === "dark" ? "Light" : "Dark";
+      btn.title = state.theme === "dark" ? "Switch to light theme" : "Switch to dark theme";
+    }
+  }
+  function toggleTheme() {
+    state.theme = state.theme === "dark" ? "light" : "dark";
+    applyTheme();
+    saveTheme();
+  }
   // Shape-robust: a TxPoW JSON object always carries BOTH `txpowid` and `size`.
   // Recursively find it, whatever the response nesting (the v1.0.39 fixed-path
   // lookup missed the real shape — which is why its size guard never fired).
@@ -6293,6 +6375,8 @@ a { color: var(--accent); }
     for (const t of document.querySelectorAll(".tab")) {
       t.addEventListener("click", () => tabSwitch(t.dataset.tab));
     }
+    // Theme toggle (nav)
+    document.getElementById("themeToggle").addEventListener("click", toggleTheme);
     // Selection bar
     document.getElementById("clearBtn").addEventListener("click", onClearSelection);
     document.getElementById("sendBtn").addEventListener("click", openSendModal);
@@ -6397,6 +6481,8 @@ a { color: var(--accent); }
   MDS.init(async function (msg) {
     if (msg.event === "inited") {
       wire();
+      // Apply the saved theme as early as possible to minimise a light flash.
+      try { await loadTheme(); applyTheme(); } catch {}
       try {
         const aboutEl = document.getElementById("aboutLine");
         if (aboutEl) aboutEl.textContent = "utxoWallet · v" + UTXOWALLET_VERSION;
