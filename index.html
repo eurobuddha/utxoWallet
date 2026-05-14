@@ -1793,7 +1793,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.36";
+  const UTXOWALLET_VERSION = "1.0.37";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -4353,6 +4353,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
     return { targets: addresses, perAddr, burn, changeAmt };
   }
   function updateDistributeSummary() {
+    // Clear first so a stale "N × amount = …" line can't linger when the form
+    // becomes invalid via an amount/burn error (readDistributeForm returns null
+    // on those paths without touching this note). readDistributeForm still
+    // overwrites this note for the errors it DOES own (no addresses / not
+    // enough funds), so those messages survive the early return below.
+    setNote("distributeSummaryNote", "", "info");
     const form = readDistributeForm();
     if (!form) return;  // readDistributeForm already set the relevant error note
     const tokLab = tokenLabel(state.selectedTokenid || "0x00");
