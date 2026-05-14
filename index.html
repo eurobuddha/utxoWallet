@@ -1626,7 +1626,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       <div class="tx-row"><div class="left" id="consolidateToken">—</div></div>
     </div>
     <div class="setting-desc" style="margin: 10px 0 4px;">
-      Merges several small UTXOs of this token into fewer, larger ones — useful for clearing dust. Needs at least 3 coins. Run a dry run first to preview.
+      Gathers your smallest coins for this token (from up to 5 of your addresses) and sends them back to you as 2 coins. Needs at least 3 coins. If your coins are spread across many addresses you may need to run this more than once. Every Consolidate is dry-run checked first and won't post if it wouldn't actually reduce your coin count — use <b>Dry run</b> to preview the exact effect.
     </div>
     <div class="field">
       <div class="field-label"><span class="label">Max coins to merge (3–20)</span></div>
@@ -1704,7 +1704,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.32";
+  const UTXOWALLET_VERSION = "1.0.33";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -4943,6 +4943,35 @@ body { padding-top: env(safe-area-inset-top, 0); }
     if (!ok) return null;
     return { maxcoins, coinage, burn };
   }
+  // Build the `consolidate` command string. maxsigs is hardcoded to 5 — Minima's
+  // own default AND maximum. Minima's consolidate only pulls coins from up to
+  // `maxsigs` distinct addresses before it stops, so a low value (we previously
+  // hardcoded 1) means it gathers almost nothing and the internal `send split:2`
+  // ends up splitting one coin in two — INCREASING the coin count. 5 gives it
+  // the widest reach so it actually reduces the count.
+  function buildConsolidateCmd(form, dry) {
+    const { tokenid } = _consolidateCtx;
+    const burnParam = (_consolidateCtx.isNative && form.burn !== "0") ? ` burn:${form.burn}` : "";
+    return `consolidate tokenid:${tokenid} coinage:${form.coinage}` +
+           ` maxcoins:${form.maxcoins} maxsigs:5${burnParam}` +
+           ` dryrun:${dry ? "true" : "false"}`;
+  }
+  // Pull input/output coin counts out of a consolidate dry-run response. The
+  // response is the fully-built TxPoW JSON (consolidate forwards send's
+  // `response` field) — body.txn.inputs / body.txn.outputs. Returns numbers or
+  // null when the shape can't be parsed.
+  function parseConsolidateCounts(res) {
+    const r = (res && res.response) || {};
+    const txn = (r.body && r.body.txn) || r.txn || r.transaction || null;
+    let inputs = null, outputs = null;
+    if (txn) {
+      if (Array.isArray(txn.inputs)) inputs = txn.inputs.length;
+      if (Array.isArray(txn.outputs)) outputs = txn.outputs.length;
+    }
+    if (inputs == null && Array.isArray(r.inputs)) inputs = r.inputs.length;
+    if (outputs == null && Array.isArray(r.outputs)) outputs = r.outputs.length;
+    return { inputs, outputs };
+  }
   async function runConsolidate(dryrun) {
     if (!_consolidateCtx) return;
     const form = readConsolidateForm();
@@ -4958,17 +4987,33 @@ body { padding-top: env(safe-area-inset-top, 0); }
         return;
       }
     }
-    const { tokenid, symbol } = _consolidateCtx;
-    const burnParam = (_consolidateCtx.isNative && form.burn !== "0") ? ` burn:${form.burn}` : "";
-    const cmd = `consolidate tokenid:${tokenid} coinage:${form.coinage}` +
-                ` maxcoins:${form.maxcoins} maxsigs:1${burnParam}` +
-                ` dryrun:${dryrun ? "true" : "false"}`;
+    const { symbol } = _consolidateCtx;
     const dryBtn = document.getElementById("consolidateDryRunBtn");
     const goBtn = document.getElementById("consolidateGoBtn");
     dryBtn.disabled = true; goBtn.disabled = true;
-    setNote("consolidateStatus", dryrun ? "Simulating…" : "Consolidating…", "info");
+    setNote("consolidateStatus", dryrun ? "Simulating…" : "Checking…", "info");
     try {
-      const res = await mds(cmd);
+      // For a real consolidate, ALWAYS pre-flight with a dry run first. It's
+      // read-safe (no signing, no posting, no pending prompt) and lets us
+      // refuse the post when it wouldn't actually reduce the coin count —
+      // the bug that turned 13 coins into 14.
+      if (!dryrun) {
+        const sim = await mds(buildConsolidateCmd(form, true));
+        const { inputs, outputs } = parseConsolidateCounts(sim);
+        renderConsolidateSim(sim);
+        if (inputs != null && outputs != null && inputs <= outputs) {
+          setNote("consolidateStatus",
+            `This would spend ${inputs} coin${inputs === 1 ? "" : "s"} and create ${outputs} — ` +
+            "no reduction, so it's not posted. Your coins for this token may be spread across " +
+            "more than 5 of your addresses (consolidate can only reach 5 at a time) — run it " +
+            "again after this batch settles, or it may already be as consolidated as it can get.",
+            "error");
+          dryBtn.disabled = false; goBtn.disabled = false;
+          return;
+        }
+      }
+      setNote("consolidateStatus", dryrun ? "Simulating…" : "Consolidating…", "info");
+      const res = await mds(buildConsolidateCmd(form, dryrun));
       if (dryrun) {
         renderConsolidateSim(res);
         setNote("consolidateStatus", "Dry run complete — review above, then Consolidate.", "ok");
@@ -4996,40 +5041,36 @@ body { padding-top: env(safe-area-inset-top, 0); }
       dryBtn.disabled = false; goBtn.disabled = false;
     }
   }
-  // Render whatever the dryrun response gives us — the shape varies between
-  // MDS builds, so probe the common txn paths and fall back to a count.
+  // Honest dry-run preview: how many coins go in, how many come out, and the
+  // net effect. Minima's consolidate always emits 2 outputs (`send split:2`),
+  // so a useful consolidation is inputs > outputs.
   function renderConsolidateSim(res) {
     const body = document.getElementById("consolidateSimBody");
+    document.getElementById("consolidateSim").hidden = false;
     clearNode(body);
-    const r = (res && res.response) || {};
-    // Try the documented txn shapes for input/output counts.
-    const txn = r.txn || (r.body && r.body.txn) || r.transaction || null;
-    let inputs = null, outputs = null;
-    if (txn) {
-      inputs = Array.isArray(txn.inputs) ? txn.inputs.length : null;
-      outputs = Array.isArray(txn.outputs) ? txn.outputs.length : null;
-    }
-    if (inputs == null && Array.isArray(r.inputs)) inputs = r.inputs.length;
-    if (outputs == null && Array.isArray(r.outputs)) outputs = r.outputs.length;
-    const rows = [];
-    if (inputs != null) rows.push(["Coins merged", String(inputs)]);
-    if (outputs != null) rows.push(["Resulting coins", String(outputs)]);
-    const size = r.size || (txn && txn.size);
-    if (size) rows.push(["Transaction size", String(size) + " bytes"]);
-    const burn = r.burn || (txn && txn.burn);
-    if (burn != null && String(burn) !== "0") rows.push(["Burn", String(burn) + " MINIMA"]);
-    if (rows.length) {
-      for (const [k, v] of rows) {
-        body.appendChild(el("div", { class: "tx-row" },
-          el("div", { class: "left", text: k }),
-          el("div", { class: "right", text: v }),
-        ));
-      }
-    } else {
-      // Couldn't parse the shape — show that the simulation at least succeeded.
+    const { inputs, outputs } = parseConsolidateCounts(res);
+    if (inputs == null || outputs == null) {
+      // Shape unparseable — show the simulation at least ran, log for diagnosis.
       body.appendChild(el("div", { class: "tx-row" },
         el("div", { class: "left", text: "Simulation OK — node accepted the consolidation." })));
       try { MDS.log("utxoWallet.consolidate dryrun shape: " + JSON.stringify(res).slice(0, 500)); } catch {}
+      return;
+    }
+    const net = inputs - outputs;
+    const rows = [
+      ["Coins spent", String(inputs)],
+      ["Coins created", String(outputs)],
+      ["Net change", (net > 0 ? "−" : net < 0 ? "+" : "") + String(Math.abs(net)) + " coins"],
+    ];
+    for (const [k, v] of rows) {
+      body.appendChild(el("div", { class: "tx-row" },
+        el("div", { class: "left", text: k }),
+        el("div", { class: "right", text: v }),
+      ));
+    }
+    if (net <= 0) {
+      body.appendChild(el("div", { class: "field-note error", style: { marginTop: "8px" },
+        text: "No reduction — consolidating would not reduce your coin count. See the note below." }));
     }
   }
 
