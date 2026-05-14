@@ -1305,6 +1305,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
    internal SQL states to one of these classes. */
 .status-pill.sending       { color: var(--blue);   border-color: var(--blue-soft);     background: var(--blue-soft); }
 .status-pill.action_needed { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
+.status-pill.repost        { color: var(--amber);  border-color: var(--amber-border);  background: var(--amber-soft); }
 .status-pill.confirmed     { color: var(--accent); border-color: var(--accent-soft);   background: var(--accent-soft); }
 .status-pill.failed        { color: var(--red);    border-color: var(--red-border);    background: var(--red-soft); }
 
@@ -1827,12 +1828,15 @@ body { padding-top: env(safe-area-inset-top, 0); }
     // Single-flight guard for resumeDistributeJob (NEWBLOCK can fire while a
     // batch build is still awaiting).
     _distributeJobInFlight: false,
-    // Wall-clock ms of the last / second-to-last NEWBLOCK seen this session.
-    // Used to tell a stalled node tip apart from a genuinely failed txn — a
-    // valid transaction can't land if the chain isn't producing blocks, and
-    // that must NOT be mistaken for a wallet failure.
+    // Wall-clock ms of the last NEWBLOCK seen this session, plus the most
+    // recent node-side `block`-command tip-age probe. Together they tell a
+    // stalled node tip apart from a genuinely failed txn — a valid transaction
+    // can't land if the chain isn't producing blocks, and that must NOT be
+    // mistaken for a wallet failure. The probe is session-independent, so it
+    // also catches a node that was already stalled before the dapp opened.
     lastBlockAt: 0,
-    prevBlockAt: 0,
+    chainTipAgeMs: 0,
+    chainTipProbedAt: 0,
   };
   const RESUME_THROTTLE_BLOCKS = 2;
   // Minima's MAX_RELAY_OUTPUTCOINS — a txn with more output coins than this is
@@ -1855,10 +1859,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // used for the pre-flight warning before a Distribute, and to explain a
   // slow-to-land txn honestly instead of blaming the wallet.
   const TIP_STALE_MS = 5 * 60 * 1000;
+  // Minima's node keeps an unmined TxPoW in its RAM mempool for only ~1 hour
+  // (RamDB, NUMBER_HOURS_RAMTXPOWDB = 1) — and a node restart clears it
+  // outright. Past this age a still-unconfirmed txn has been dropped from the
+  // mempool and will never land on its own: it must be re-posted. This is a
+  // node-protocol constant, not an arbitrary give-up timer.
+  const RAM_EVICTION_SECS = 60 * 60;
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.42";
+  const UTXOWALLET_VERSION = "1.0.43";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -3000,6 +3010,88 @@ body { padding-top: env(safe-area-inset-top, 0); }
       toast("Could not dismiss row — see MDS log.", "error");
     }
   }
+  // Re-post a transaction the node dropped from its mempool (RAM-evicted after
+  // ~1h, or cleared by a node restart). Rebuilds the SAME inputs→outputs from
+  // the stored History row and routes through the normal confirm modal so the
+  // user re-approves an irreversible action. The old row is left as the failed
+  // record; a fresh row tracks the new attempt. Single transactions only — a
+  // failed Distribute batch still leaves the remaining addresses for a re-run.
+  async function repostHistoryRow(row) {
+    if (state.pendingTxId !== null || state.distributeJob) {
+      toast("A transaction is already in progress — wait for it to finish.", "warn");
+      return;
+    }
+    // Same WRITE + node-lock guards as openSendModal — don't walk the user
+    // into a build that's guaranteed to fail at the signing step.
+    if (!state.settings.writeConfirmed) {
+      await probeWritePermission();
+      if (!state.settings.writeConfirmed) {
+        tabSwitch("settings");
+        toast("Grant WRITE permission first.", "warn");
+        return;
+      }
+    }
+    await probeNodeLock();
+    if (state.settings.nodeLocked) {
+      tabSwitch("settings");
+      toast("Your node is locked — unlock it to sign.", "warn");
+      return;
+    }
+    // Reconstruct inputs + outputs from the stored row.
+    let inputs = [], outputs = [];
+    try { inputs = JSON.parse(row.INPUTS || "[]"); } catch {}
+    try { outputs = JSON.parse(row.OUTPUTS || "[]"); } catch {}
+    // Pre-v5 rows have no outputs[] — fall back to the single recipient/amount.
+    if (!outputs.length && row.RECIPIENT) {
+      outputs = [{ address: String(row.RECIPIENT), amount: String(row.AMOUNT || "0") }];
+    }
+    if (!inputs.length || !outputs.length) {
+      toast("This row is too old to re-post automatically — rebuild the transaction manually.", "warn");
+      return;
+    }
+    const tokenid = String(row.TOKENID || "0x00");
+    const burn = String(row.BURN || "0");
+    // Re-resolve every input coin against the CURRENT coin set. If any is gone,
+    // the original txn may actually have landed (or the coins were spent some
+    // other way) — never re-post in that case.
+    const coins = [];
+    for (const inp of inputs) {
+      const c = state.coins.find(cc => cc && cc.coinid === (inp && inp.coinid));
+      if (!c) {
+        toast("Some input coins are no longer in your wallet — refresh and check History before re-posting.", "warn");
+        return;
+      }
+      coins.push(c);
+    }
+    // total = sum of the (still-present) inputs; change = total − outputs − burn.
+    const total = coins.reduce((a, c) => bigAdd(a, coinAmt(c)), "0");
+    let outSum = "0";
+    for (const o of outputs) outSum = bigAdd(outSum, String((o && o.amount) || "0"));
+    const needed = bigAdd(outSum, burn);
+    if (bigGt(needed, total)) {
+      toast("Your input coins no longer cover this transaction — rebuild it manually.", "warn");
+      return;
+    }
+    const changeAmt = bigSub(total, needed);
+    let change = String(row.CHANGEADDR || "");
+    if (isPositive(changeAmt) && !change) {
+      change = await getNextDefaultChangeAddr();
+      if (!change) { toast("Could not get a change address from the node.", "error"); return; }
+    }
+    // Same pre-flight tip-staleness heads-up the Distribute flow gives.
+    const tip = await getChainTipAge();
+    pendingPreview = {
+      mode: outputs.length > 1 ? "distribute" : "send",
+      isRepost: true,
+      selectedCoins: coins,
+      outputs,
+      change, changeAmt,
+      burn, tokenid, total,
+      chainTipStaleMs: tip && tip.stale ? tip.ageMs : 0,
+      distributeJob: null,
+    };
+    renderConfirm(pendingPreview);
+  }
   async function loadHistory() {
     try {
       state.history = await sql("SELECT * FROM history ORDER BY id DESC LIMIT 500");
@@ -4125,11 +4217,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
 
     // Pre-flight chain-staleness heads-up — the txn is still valid, it'll just
     // sit pending until the node's chain advances. Honest warning, not a block.
-    if (mode === "distribute" && preview.chainTipStaleMs > 0) {
+    // Shown for any preview that carries a probe result (Distribute, Re-post).
+    if (preview.chainTipStaleMs > 0) {
       const mins = Math.max(1, Math.round(preview.chainTipStaleMs / 60000));
       body.appendChild(el("div", { class: "tx-warn" },
         el("b", null, "Your node's chain tip looks stale."),
-        document.createTextNode(` The latest block is about ${mins} minute${mins === 1 ? "" : "s"} old. The transaction will be posted and is valid, but it can only land once your node's chain starts advancing again — batches may take a while, and the wallet will wait rather than fail them.`),
+        document.createTextNode(` The latest block is about ${mins} minute${mins === 1 ? "" : "s"} old. The transaction will be posted and is valid, but it can only land once your node's chain starts advancing again. If your node is offline or restarts, re-post it.`),
       ));
     }
 
@@ -4146,7 +4239,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
     // Title reflects the operation.
     const titleEl = document.querySelector("#confirmModal .modal-title");
     if (titleEl) {
-      titleEl.textContent = mode === "split" ? "Confirm split"
+      titleEl.textContent = preview.isRepost ? "Confirm re-post"
+        : mode === "split" ? "Confirm split"
         : mode === "distribute" ? "Confirm distribute" : "Confirm transaction";
     }
 
@@ -4171,6 +4265,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // Reopen the form modal that the current preview came from.
   function backToForm() {
     closeConfirmModal();
+    // A Re-post preview is built from a History row, not a form modal — there
+    // is nothing to reopen, so just discard it.
+    if (pendingPreview && pendingPreview.isRepost) { pendingPreview = null; return; }
     const mode = pendingPreview && pendingPreview.mode;
     const id = mode === "split" ? "splitModal"
              : mode === "distribute" ? "distributeModal" : "sendModal";
@@ -4629,6 +4726,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const jobSeed = pendingPreview.distributeJob || null;
     const jobChangeAddr = pendingPreview.change || "";
     const jobChangeAmt = pendingPreview.changeAmt || "0";
+    // A Re-post is driven from a History row, not the Wallet-tab selection —
+    // don't clear the user's current coin selection out from under them.
+    const isRepost = !!pendingPreview.isRepost;
     try {
       const result = await buildTransaction(pendingPreview, setStage);
       markPriorStagesDone("__done__");
@@ -4645,8 +4745,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
         toast("Transaction posted ✓", "success");
       }
       // Clear selection + close
-      state.selected.clear();
-      state.selectedTokenid = null;
+      if (!isRepost) {
+        state.selected.clear();
+        state.selectedTokenid = null;
+      }
       pendingPreview = null;
       closeConfirmModal();
       renderWallet();
@@ -4663,8 +4765,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
         if (jobSeed && state.pendingApproval && state.pendingApproval.internalid) {
           startDistributeJob(jobSeed, { internalid: state.pendingApproval.internalid }, jobChangeAddr, jobChangeAmt);
         }
-        state.selected.clear();
-        state.selectedTokenid = null;
+        if (!isRepost) {
+          state.selected.clear();
+          state.selectedTokenid = null;
+        }
         pendingPreview = null;
         closeConfirmModal();
         renderWallet();
@@ -5318,8 +5422,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
     try {
       // Include the recipient/amount/tokenid columns so the txpowid lookup
       // can match against output records without a second query per row.
-      // `status` + `postblock` drive the block-count "never landed" judgement.
-      rows = await sql("SELECT internalid, txnid, status, ts, coinids, recipient, amount, tokenid, postblock FROM history WHERE status IN ('posting','posted','finalizing') ORDER BY ts ASC");
+      // `status` + `postblock` drive the block-count "never landed" judgement;
+      // `note` lets the stall branch skip a no-op UPDATE when nothing changed.
+      rows = await sql("SELECT internalid, txnid, status, note, ts, coinids, recipient, amount, tokenid, postblock FROM history WHERE status IN ('posting','posted','finalizing') ORDER BY ts ASC");
     } catch { return; }
     const ageSecs = (ts) => (Date.now() - parseInt(ts, 10)) / 1000;
 
@@ -5411,23 +5516,38 @@ body { padding-top: env(safe-area-inset-top, 0); }
       }
       const blocksElapsed = (postBlock > 0 && state.chainBlock > 0)
         ? state.chainBlock - postBlock : -1;
+      // Past Minima's ~1h RAM mempool TTL the node has dropped the TxPoW (and a
+      // node restart drops it sooner) — it can no longer land on its own.
+      const ramEvicted = ageSecs(ts) > RAM_EVICTION_SECS;
 
       if (blocksElapsed >= CONFIRM_EXPIRY_BLOCKS) {
         // The chain advanced CONFIRM_EXPIRY_BLOCKS+ since we posted and the
         // inputs are STILL spendable — the transaction genuinely never landed
-        // (denied, build failed, or network-rejected before mining).
+        // (denied, build failed, network-rejected, or dropped before mining).
         await markHistoryStatus(internalid, "rejected",
-          `Inputs still spendable ${blocksElapsed} blocks after posting — tx never landed on chain.`).catch(() => {});
+          `Inputs still spendable ${blocksElapsed} blocks after posting — tx never landed on chain. Use Re-post to rebuild and broadcast it again.`).catch(() => {});
         try { MDS.log("utxoWallet.watcher: " + internalid + " → rejected (" + blocksElapsed + " blocks elapsed, inputs still present)"); } catch {}
+      } else if (ramEvicted) {
+        // 1+ hour old, inputs still spendable, chain hasn't given a verdict.
+        // Minima keeps an unmined TxPoW in RAM for only ~1 hour, and a restart
+        // clears it — so the node has dropped this from its mempool. It will
+        // NOT land on its own; the only remedy is to re-post it.
+        await markHistoryStatus(internalid, "needs_repost",
+          "Posted over an hour ago and still not on chain. Your node only holds an unmined transaction for ~1 hour (a restart clears it sooner), so it has been dropped from the mempool — use Re-post to broadcast it again.").catch(() => {});
+        try { MDS.log("utxoWallet.watcher: " + internalid + " → needs_repost (>1h old, inputs still present — RAM-evicted)"); } catch {}
       } else if (ageSecs(ts) > 5 * 60 && blocksElapsed >= 0) {
         // 5+ minutes of wall-clock have passed but the chain has barely moved.
-        // The node's tip is stalled or crawling — the txn is valid and still
-        // pending. Keep the row alive (status unchanged); surface the stall
-        // honestly instead of blaming the wallet.
+        // The node's tip is stalled or crawling — under the 1h RAM window the
+        // txn is still in the mempool and can land. Keep the row alive (status
+        // unchanged); surface the stall honestly, including the re-post escape
+        // hatch if the node restarts or the stall outlasts the mempool.
         const stallNote = blocksElapsed === 0
-          ? "Waiting — your Minima node hasn't produced a block since this was posted. The transaction is valid and will land once the node's chain advances."
-          : `Waiting — your Minima node's chain has advanced only ${blocksElapsed} block${blocksElapsed === 1 ? "" : "s"} since this was posted. The transaction is valid and will land once the node catches up.`;
-        await markHistoryStatus(internalid, row.STATUS || "posted", stallNote).catch(() => {});
+          ? "Waiting — your Minima node hasn't produced a block since this was posted. It should land once the chain advances; if your node restarts or stays stalled past an hour, use Re-post."
+          : `Waiting — your Minima node's chain has advanced only ${blocksElapsed} block${blocksElapsed === 1 ? "" : "s"} since this was posted. It should land once the node catches up; if your node restarts or stays stalled past an hour, use Re-post.`;
+        // Status is unchanged here, so skip the UPDATE when the note is identical.
+        if (stallNote !== String(row.NOTE || "")) {
+          await markHistoryStatus(internalid, row.STATUS || "posted", stallNote).catch(() => {});
+        }
         try { MDS.log("utxoWallet.watcher: " + internalid + " → still pending (chain stalled, " + blocksElapsed + " blocks since post)"); } catch {}
       }
     }
@@ -5511,7 +5631,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
         return;
       }
       // Terminal failure of the last batch → stop, leave the rest for a re-run.
-      if (status === "error" || status === "rejected" || status === "could_not_confirm" || status === "expired") {
+      if (status === "error" || status === "rejected" || status === "could_not_confirm" || status === "expired" || status === "needs_repost") {
         finishDistributeJob("failed",
           `Distribute stopped — batch ${job.batchesDone}/${job.batchCount} failed. ` +
           `${job.totalAddresses - job.remaining.length} of ${job.totalAddresses} addresses covered; re-run Distribute for the remaining ${job.remaining.length}.`);
@@ -5589,11 +5709,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
       state._distributeJobInFlight = false;
     }
   }
-  // True when the node's chain tip hasn't moved in a while (judged from the
-  // gap since the last NEWBLOCK this session). A stalled tip is why a posted
-  // txn sits pending — the wallet waits it out rather than failing the job.
+  // How long the node's chain tip has been static, in ms. Prefers the
+  // session-independent `block`-command probe (refreshed by the heartbeat) so
+  // it works even when the node was already stalled before the dapp opened;
+  // falls back to the NEWBLOCK cadence. 0 = no data (treated as not stalled).
+  function chainStallMs() {
+    if (state.chainTipProbedAt > 0) return state.chainTipAgeMs;
+    return state.lastBlockAt > 0 ? Date.now() - state.lastBlockAt : 0;
+  }
   function chainStalled() {
-    return state.lastBlockAt > 0 && (Date.now() - state.lastBlockAt) > TIP_STALE_MS;
+    return chainStallMs() > TIP_STALE_MS;
   }
   function renderDistributeBanner() {
     const banner = document.getElementById("distributeBanner");
@@ -5606,9 +5731,9 @@ body { padding-top: env(safe-area-inset-top, 0); }
     banner.appendChild(el("div", { class: "dist-banner-title",
       text: `Distribute in progress — batch ${job.batchesDone} of ${job.batchCount}` }));
     if (chainStalled()) {
-      const mins = Math.round((Date.now() - state.lastBlockAt) / 60000);
+      const mins = Math.max(1, Math.round(chainStallMs() / 60000));
       banner.appendChild(el("div", { class: "dist-banner-sub",
-        text: `${covered} of ${job.totalAddresses} addresses posted. Paused — your node's chain hasn't advanced in ~${mins} min. The posted batch is valid and the job will continue automatically once your node catches up; keep it online.` }));
+        text: `${covered} of ${job.totalAddresses} addresses posted. Paused — your node's chain hasn't advanced in ~${mins} min. The job continues automatically once your node catches up; keep it online. If your node restarts or stalls past an hour, re-run Distribute for the addresses not yet covered.` }));
     } else {
       banner.appendChild(el("div", { class: "dist-banner-sub",
         text: `${covered} of ${job.totalAddresses} addresses posted. The wallet posts the next batch as each one confirms — keep this node online until it's done.` }));
@@ -5674,6 +5799,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
       case "finalizing":
       case "posted":             return "sending";        // dapp is working
       case "awaiting_approval":  return "action_needed";  // user must approve in MiniHub
+      case "needs_repost":       return "repost";         // node dropped it — re-post
       case "confirmed":          return "confirmed";      // terminal happy
       case "error":
       case "rejected":
@@ -5686,6 +5812,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
     switch (statusBucket(s)) {
       case "sending":        return "Sending";
       case "action_needed":  return "Approve in MiniHub";
+      case "repost":         return "Re-post needed";
       case "confirmed":      return "Confirmed";
       case "failed":         return "Failed";
       default:               return s;
@@ -5897,7 +6024,23 @@ body { padding-top: env(safe-area-inset-top, 0); }
       });
       terminalActions.appendChild(resumeBtn);
     }
-    if (bucket === "failed") {
+    if (status === "rejected" || status === "needs_repost") {
+      const repostBtn = el("button", { class: "history-resume-btn", text: "Re-post", type: "button" });
+      repostBtn.title = "Rebuild this transaction from its stored inputs and broadcast it again.";
+      repostBtn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        repostBtn.disabled = true;
+        repostBtn.textContent = "Re-posting…";
+        repostHistoryRow(row).catch((err) => {
+          try { MDS.log("utxoWallet.repost click failed: " + JSON.stringify(err)); } catch {}
+        }).then(() => {
+          repostBtn.disabled = false;
+          repostBtn.textContent = "Re-post";
+        });
+      });
+      terminalActions.appendChild(repostBtn);
+    }
+    if (bucket === "failed" || bucket === "repost") {
       const dismissBtn = el("button", { class: "history-dismiss-btn", text: "Dismiss", type: "button" });
       dismissBtn.title = "Permanently remove this row from your history.";
       dismissBtn.addEventListener("click", (ev) => {
@@ -6295,18 +6438,23 @@ body { padding-top: env(safe-area-inset-top, 0); }
         toast("Init error — see console.", "error");
       }
       // Heartbeat — NEWBLOCK can go quiet for minutes if the node's chain
-      // stalls. Re-render the Distribute banner on a timer so it can show the
-      // "paused — chain hasn't advanced" state instead of looking active.
-      setInterval(() => { if (state.distributeJob) renderDistributeBanner(); }, 30000);
+      // stalls. While a Distribute is running, probe the node's tip age (the
+      // `block` command is session-independent, unlike the NEWBLOCK cadence)
+      // and re-render the banner so it can show the "paused" state honestly.
+      setInterval(async () => {
+        if (!state.distributeJob) return;
+        const tip = await getChainTipAge();
+        if (tip) { state.chainTipAgeMs = tip.ageMs; state.chainTipProbedAt = Date.now(); }
+        renderDistributeBanner();
+      }, 30000);
     } else if (msg.event === "NEWBALANCE") {
       debouncedLoadCoins();
     } else if (msg.event === "NEWBLOCK") {
       try {
         state.chainBlock = parseInt((msg.data && msg.data.txpow && msg.data.txpow.header && msg.data.txpow.header.block) || 0, 10) || state.chainBlock;
         document.getElementById("blockNo").textContent = "#" + (state.chainBlock || "—");
-        // Track block arrival cadence — a stalled tip is detected by the gap
-        // since the last NEWBLOCK, not by a fixed timer.
-        state.prevBlockAt = state.lastBlockAt;
+        // Track block arrival cadence — the fallback stalled-tip signal when
+        // no `block`-command probe has run yet this session.
         state.lastBlockAt = Date.now();
       } catch {}
       // Order matters: loadCoins → resumePendingBuild → watchPendingConfirmations.
