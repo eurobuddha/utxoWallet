@@ -1827,6 +1827,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
     // Single-flight guard for resumeDistributeJob (NEWBLOCK can fire while a
     // batch build is still awaiting).
     _distributeJobInFlight: false,
+    // Wall-clock ms of the last / second-to-last NEWBLOCK seen this session.
+    // Used to tell a stalled node tip apart from a genuinely failed txn — a
+    // valid transaction can't land if the chain isn't producing blocks, and
+    // that must NOT be mistaken for a wallet failure.
+    lastBlockAt: 0,
+    prevBlockAt: 0,
   };
   const RESUME_THROTTLE_BLOCKS = 2;
   // Minima's MAX_RELAY_OUTPUTCOINS — a txn with more output coins than this is
@@ -1838,10 +1844,21 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // How many blocks a batched-Distribute job waits for a batch to confirm
   // before giving up (and leaving the rest for the user to re-run).
   const DISTRIBUTE_BATCH_EXPIRY_BLOCKS = 25;
+  // A posted txn is only a genuine "never landed" failure once the chain has
+  // actually advanced this many blocks past the post AND the inputs are still
+  // spendable. Counting BLOCKS — not wall-clock seconds — is what makes a
+  // stalled / crawling node tip safe: if the chain isn't producing blocks,
+  // the count doesn't move and the txn stays pending instead of being
+  // mislabelled rejected (which used to abort the whole Distribute job).
+  const CONFIRM_EXPIRY_BLOCKS = 12;
+  // A node whose latest block is older than this is treated as "tip stale" —
+  // used for the pre-flight warning before a Distribute, and to explain a
+  // slow-to-land txn honestly instead of blaming the wallet.
+  const TIP_STALE_MS = 5 * 60 * 1000;
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.41";
+  const UTXOWALLET_VERSION = "1.0.42";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -2793,7 +2810,7 @@ body { padding-top: env(safe-area-inset-top, 0); }
   // ─── DB schema + history ───────────────────────────────────────────
   // Schema migration version. Bump alongside any future ALTER step; ensureTable
   // applies only the steps whose version exceeds the last-applied marker.
-  const SCHEMA_VERSION = 5;
+  const SCHEMA_VERSION = 6;
 
   async function getSchemaVersionApplied() {
     return new Promise((resolve) => {
@@ -2876,7 +2893,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
         try { MDS.log("utxoWallet.ensureTable: outputs-column migration v5: " + JSON.stringify(e)); } catch {}
       });
     }
-    // Verify both v4+v5 columns actually exist before bumping the schema marker.
+    if (applied < 6) {
+      // v6 (v1.0.42): record the chain height at post time so the watcher can
+      // judge "never landed" in BLOCKS, not wall-clock seconds — a stalled node
+      // tip must not be mistaken for a failed transaction. Old rows have
+      // postblock=null; the watcher lazily anchors those to the current height.
+      await sql("ALTER TABLE `history` ADD COLUMN `postblock` BIGINT").catch((e) => {
+        try { MDS.log("utxoWallet.ensureTable: postblock-column migration v6: " + JSON.stringify(e)); } catch {}
+      });
+    }
+    // Verify the v4+v5+v6 columns actually exist before bumping the schema marker.
     // If an ALTER failed for a real reason (corrupt page, disk, syntax drift),
     // we want the next boot to retry — not silently stamp the version and break
     // every future INSERT against the missing column.
@@ -2884,10 +2910,10 @@ body { padding-top: env(safe-area-inset-top, 0); }
       const cols = await sql("SHOW COLUMNS FROM `history`").catch(() => []);
       const names = new Set(cols.map(c =>
         String(c.FIELD || c.NAME || c.COLUMN_NAME || "").toLowerCase()));
-      if (names.has("inputs") && names.has("outputs")) {
+      if (names.has("inputs") && names.has("outputs") && names.has("postblock")) {
         setSchemaVersionApplied(SCHEMA_VERSION);
       } else {
-        try { MDS.log("utxoWallet.ensureTable: schema marker NOT bumped — inputs/outputs column missing after migration; will retry on next boot."); } catch {}
+        try { MDS.log("utxoWallet.ensureTable: schema marker NOT bumped — inputs/outputs/postblock column missing after migration; will retry on next boot."); } catch {}
       }
     }
   }
@@ -2911,8 +2937,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
     // v1.0.34 schema v5: full output list for multi-output txns (Split/Distribute).
     const outputsArr = Array.isArray(rec.outputs) ? rec.outputs : [];
     const outputsJson = JSON.stringify(outputsArr);
+    // v1.0.42 schema v6: chain height at post time (0 if NEWBLOCK hasn't fired
+    // yet — the watcher anchors those lazily once the height is known).
+    const postBlock = parseInt(rec.postblock, 10);
+    const postBlockVal = Number.isFinite(postBlock) && postBlock > 0 ? postBlock : 0;
     const q =
-      "INSERT INTO history (internalid, txnid, status, recipient, amount, tokenid, coinids, changeaddr, burn, ts, note, inputs, outputs) VALUES (" +
+      "INSERT INTO history (internalid, txnid, status, recipient, amount, tokenid, coinids, changeaddr, burn, ts, note, inputs, outputs, postblock) VALUES (" +
       `'${sqlQuote(rec.internalid)}', ` +
       `'${sqlQuote(rec.txnid || rec.internalid)}', ` +
       `'${sqlQuote(rec.status || "posting")}', ` +
@@ -2925,7 +2955,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
       `${parseInt(rec.ts, 10)}, ` +
       `'${sqlQuote(rec.note || "")}', ` +
       `'${sqlQuote(inputsJson)}', ` +
-      `'${sqlQuote(outputsJson)}')`;
+      `'${sqlQuote(outputsJson)}', ` +
+      `${postBlockVal})`;
     await sql(q);
     // Clip to most-recent 500
     await sql("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY id DESC LIMIT 500)").catch(() => {});
@@ -4092,6 +4123,16 @@ body { padding-top: env(safe-area-inset-top, 0); }
       ));
     }
 
+    // Pre-flight chain-staleness heads-up — the txn is still valid, it'll just
+    // sit pending until the node's chain advances. Honest warning, not a block.
+    if (mode === "distribute" && preview.chainTipStaleMs > 0) {
+      const mins = Math.max(1, Math.round(preview.chainTipStaleMs / 60000));
+      body.appendChild(el("div", { class: "tx-warn" },
+        el("b", null, "Your node's chain tip looks stale."),
+        document.createTextNode(` The latest block is about ${mins} minute${mins === 1 ? "" : "s"} old. The transaction will be posted and is valid, but it can only land once your node's chain starts advancing again — batches may take a while, and the wallet will wait rather than fail them.`),
+      ));
+    }
+
     const warnText = mode === "split"
       ? " These coins go to your own wallet addresses."
       : mode === "distribute"
@@ -4482,6 +4523,25 @@ body { padding-top: env(safe-area-inset-top, 0); }
       setNote("distributeSummaryNote", msg, "info");
     }
   }
+  // Pre-flight chain-health probe. Reads the node's latest block timestamp via
+  // the `block` command and reports how stale the tip is. A stale tip means a
+  // posted txn will sit pending until the node's chain advances — worth a
+  // heads-up before kicking off a multi-batch Distribute. Returns null if the
+  // probe itself fails (never block the user on a probe error).
+  async function getChainTipAge() {
+    try {
+      const res = await withTimeout(mds("block"), 4000, "block.tipprobe");
+      const r = res && res.response;
+      const tMilli = parseInt((r && r.timemilli) || 0, 10);
+      const blk = parseInt((r && r.block) || 0, 10);
+      if (!Number.isFinite(tMilli) || tMilli <= 0) return null;
+      const ageMs = Date.now() - tMilli;
+      return { ageMs, block: blk, stale: ageMs > TIP_STALE_MS };
+    } catch (err) {
+      try { MDS.log("utxoWallet.getChainTipAge: probe failed: " + JSON.stringify(err)); } catch {}
+      return null;
+    }
+  }
   async function previewDistribute() {
     if (state.distributeJob) {
       setNote("distributeSummaryNote",
@@ -4509,12 +4569,17 @@ body { padding-top: env(safe-area-inset-top, 0); }
         change = await getNextDefaultChangeAddr();
         if (!change) throw { message: "Could not get a change address from the node." };
       }
+      // Pre-flight: if the node's chain tip is stale, a posted txn will just
+      // sit pending until the chain catches up. Surface it in the confirm
+      // modal so the user isn't surprised — but don't block; the txn is valid.
+      const tip = await getChainTipAge();
       pendingPreview = {
         mode: "distribute",
         selectedCoins: selectedCoins(),
         outputs,
         change, changeAmt,
         burn: form.burn, tokenid, total,
+        chainTipStaleMs: tip && tip.stale ? tip.ageMs : 0,
         // When the list spans more than one batch, this seeds the auto-chained
         // job that confirmSend kicks off once batch 1 has posted.
         distributeJob: remaining.length ? {
@@ -4864,6 +4929,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
       await recordHistoryPosting({
         internalid: txid, txnid: txid, status: "posting",
         recipient: primary.address, amount: primary.amount, tokenid,
+        // Anchor for the watcher's block-count "never landed" judgement.
+        postblock: state.chainBlock > 0 ? state.chainBlock : 0,
         // Rich per-input record so the History row can show the FROM side
         // (which addresses we spent from) — previously only coinids survived.
         inputs: sel.map(c => ({
@@ -5251,7 +5318,8 @@ body { padding-top: env(safe-area-inset-top, 0); }
     try {
       // Include the recipient/amount/tokenid columns so the txpowid lookup
       // can match against output records without a second query per row.
-      rows = await sql("SELECT internalid, txnid, ts, coinids, recipient, amount, tokenid FROM history WHERE status IN ('posting','posted','finalizing') ORDER BY ts ASC");
+      // `status` + `postblock` drive the block-count "never landed" judgement.
+      rows = await sql("SELECT internalid, txnid, status, ts, coinids, recipient, amount, tokenid, postblock FROM history WHERE status IN ('posting','posted','finalizing') ORDER BY ts ASC");
     } catch { return; }
     const ageSecs = (ts) => (Date.now() - parseInt(ts, 10)) / 1000;
 
@@ -5325,13 +5393,42 @@ body { padding-top: env(safe-area-inset-top, 0); }
         }
       }
 
-      // TIMEOUT: 5 minutes elapsed and inputs are still spendable in our wallet.
-      // Strong signal the tx never broadcast (denied, build failed, network
-      // rejected before mining). Mark rejected so the user can Dismiss and move on.
-      if (ageSecs(ts) > 5 * 60) {
+      // TIMEOUT — judged in BLOCKS, not wall-clock seconds.
+      // A transaction can only "fail to land" if the chain actually produced
+      // blocks it could have been included in. A stalled or crawling node tip
+      // is NOT a wallet failure: posting a valid txn into a node whose chain
+      // isn't advancing must never be mistaken for a rejected transaction
+      // (the old 5-minute wall-clock timeout did exactly that, and it aborted
+      // the whole auto-chained Distribute job along with it).
+      let postBlock = parseInt(row.POSTBLOCK || "0", 10);
+      if (!Number.isFinite(postBlock) || postBlock < 0) postBlock = 0;
+      // Lazily anchor rows inserted before the chain height was known (posted
+      // pre-first-NEWBLOCK, or pre-v6 rows with postblock=null). Start counting
+      // from the first block height we actually observe for this row.
+      if (postBlock === 0 && state.chainBlock > 0) {
+        postBlock = state.chainBlock;
+        await sql(`UPDATE history SET postblock=${state.chainBlock} WHERE internalid='${sqlQuote(internalid)}'`).catch(() => {});
+      }
+      const blocksElapsed = (postBlock > 0 && state.chainBlock > 0)
+        ? state.chainBlock - postBlock : -1;
+
+      if (blocksElapsed >= CONFIRM_EXPIRY_BLOCKS) {
+        // The chain advanced CONFIRM_EXPIRY_BLOCKS+ since we posted and the
+        // inputs are STILL spendable — the transaction genuinely never landed
+        // (denied, build failed, or network-rejected before mining).
         await markHistoryStatus(internalid, "rejected",
-          "Inputs still spendable after 5 min — tx never landed on chain.").catch(() => {});
-        try { MDS.log("utxoWallet.watcher: " + internalid + " → rejected (5-min timeout, inputs still present)"); } catch {}
+          `Inputs still spendable ${blocksElapsed} blocks after posting — tx never landed on chain.`).catch(() => {});
+        try { MDS.log("utxoWallet.watcher: " + internalid + " → rejected (" + blocksElapsed + " blocks elapsed, inputs still present)"); } catch {}
+      } else if (ageSecs(ts) > 5 * 60 && blocksElapsed >= 0) {
+        // 5+ minutes of wall-clock have passed but the chain has barely moved.
+        // The node's tip is stalled or crawling — the txn is valid and still
+        // pending. Keep the row alive (status unchanged); surface the stall
+        // honestly instead of blaming the wallet.
+        const stallNote = blocksElapsed === 0
+          ? "Waiting — your Minima node hasn't produced a block since this was posted. The transaction is valid and will land once the node's chain advances."
+          : `Waiting — your Minima node's chain has advanced only ${blocksElapsed} block${blocksElapsed === 1 ? "" : "s"} since this was posted. The transaction is valid and will land once the node catches up.`;
+        await markHistoryStatus(internalid, row.STATUS || "posted", stallNote).catch(() => {});
+        try { MDS.log("utxoWallet.watcher: " + internalid + " → still pending (chain stalled, " + blocksElapsed + " blocks since post)"); } catch {}
       }
     }
     // If statuses changed, reflect in History view if it's visible
@@ -5492,6 +5589,12 @@ body { padding-top: env(safe-area-inset-top, 0); }
       state._distributeJobInFlight = false;
     }
   }
+  // True when the node's chain tip hasn't moved in a while (judged from the
+  // gap since the last NEWBLOCK this session). A stalled tip is why a posted
+  // txn sits pending — the wallet waits it out rather than failing the job.
+  function chainStalled() {
+    return state.lastBlockAt > 0 && (Date.now() - state.lastBlockAt) > TIP_STALE_MS;
+  }
   function renderDistributeBanner() {
     const banner = document.getElementById("distributeBanner");
     if (!banner) return;
@@ -5502,8 +5605,14 @@ body { padding-top: env(safe-area-inset-top, 0); }
     const covered = job.totalAddresses - job.remaining.length;
     banner.appendChild(el("div", { class: "dist-banner-title",
       text: `Distribute in progress — batch ${job.batchesDone} of ${job.batchCount}` }));
-    banner.appendChild(el("div", { class: "dist-banner-sub",
-      text: `${covered} of ${job.totalAddresses} addresses posted. The wallet posts the next batch as each one confirms — keep this node online until it's done.` }));
+    if (chainStalled()) {
+      const mins = Math.round((Date.now() - state.lastBlockAt) / 60000);
+      banner.appendChild(el("div", { class: "dist-banner-sub",
+        text: `${covered} of ${job.totalAddresses} addresses posted. Paused — your node's chain hasn't advanced in ~${mins} min. The posted batch is valid and the job will continue automatically once your node catches up; keep it online.` }));
+    } else {
+      banner.appendChild(el("div", { class: "dist-banner-sub",
+        text: `${covered} of ${job.totalAddresses} addresses posted. The wallet posts the next batch as each one confirms — keep this node online until it's done.` }));
+    }
   }
 
   // ─── History rendering ─────────────────────────────────────────────
@@ -6185,12 +6294,20 @@ body { padding-top: env(safe-area-inset-top, 0); }
         try { MDS.log("utxoWallet init error: " + String(e)); } catch {}
         toast("Init error — see console.", "error");
       }
+      // Heartbeat — NEWBLOCK can go quiet for minutes if the node's chain
+      // stalls. Re-render the Distribute banner on a timer so it can show the
+      // "paused — chain hasn't advanced" state instead of looking active.
+      setInterval(() => { if (state.distributeJob) renderDistributeBanner(); }, 30000);
     } else if (msg.event === "NEWBALANCE") {
       debouncedLoadCoins();
     } else if (msg.event === "NEWBLOCK") {
       try {
         state.chainBlock = parseInt((msg.data && msg.data.txpow && msg.data.txpow.header && msg.data.txpow.header.block) || 0, 10) || state.chainBlock;
         document.getElementById("blockNo").textContent = "#" + (state.chainBlock || "—");
+        // Track block arrival cadence — a stalled tip is detected by the gap
+        // since the last NEWBLOCK, not by a fixed timer.
+        state.prevBlockAt = state.lastBlockAt;
+        state.lastBlockAt = Date.now();
       } catch {}
       // Order matters: loadCoins → resumePendingBuild → watchPendingConfirmations.
       // - loadCoins refreshes state.coins so the watcher's orphan-recovery sees this block's reality.
