@@ -1797,6 +1797,7 @@ a { color: var(--accent); }
     myWalletAddresses: new Set(),   // BOTH encodings (0x + Mx) of every wallet address — for recognition lookups
     myWalletAddressList: [],        // canonical: ONE entry per wallet address (Mx form preferred) — for enumeration (Distribute)
     myScriptAddresses: new Set(),
+    myScriptAddressList: [],        // canonical: ONE entry per tracked script address (Mx form preferred) — for the Wallet tab's empty-address listing
     chainBlock: 0,
     activeTab: "wallet",
     pendingTxId: null,
@@ -1877,7 +1878,7 @@ a { color: var(--accent); }
 
   // Build.sh verifies this matches dapp.conf's "version" field and fails the
   // build on drift, so the "About" line in Settings can't go stale again.
-  const UTXOWALLET_VERSION = "1.0.47";
+  const UTXOWALLET_VERSION = "1.0.48";
 
   // How many blocks an `awaiting_approval` row may live before we give up on it.
   // ~20 blocks ≈ 7 minutes at Minima's nominal 20s/block — enough time for the
@@ -3231,6 +3232,7 @@ a { color: var(--accent); }
     // double-count — 64 default addresses → 128 entries. nextWalletList holds
     // one entry per address, Mx form preferred.
     const nextWalletList = [];
+    const nextScriptsList = [];
     let scResp;
     try { scResp = await mds("scripts"); }
     catch { return; /* keep previous sets on failure */ }
@@ -3240,10 +3242,8 @@ a { color: var(--accent); }
       const addrs = [s && s.address, s && s.miniaddress].filter(Boolean);
       const target = isDefault ? nextWallet : nextScripts;
       for (const a of addrs) target.add(a);
-      if (isDefault) {
-        const canon = (s && s.miniaddress) || (s && s.address);
-        if (canon) nextWalletList.push(canon);
-      }
+      const canon = (s && s.miniaddress) || (s && s.address);
+      if (canon) (isDefault ? nextWalletList : nextScriptsList).push(canon);
     }
     for (const c of state.coins) {
       if (c.address && !nextWallet.has(c.address) && !nextScripts.has(c.address)) {
@@ -3256,6 +3256,7 @@ a { color: var(--accent); }
     // Dedupe defensively — a script appearing twice, or a coin address that
     // matched a script's other encoding, must not produce a duplicate output.
     state.myWalletAddressList = [...new Set(nextWalletList)];
+    state.myScriptAddressList = [...new Set(nextScriptsList)];
   }
 
   async function refreshDefaultAddress() {
@@ -3267,21 +3268,56 @@ a { color: var(--accent); }
   }
 
   // ─── Rendering: Wallet ─────────────────────────────────────────────
+  // Empty stub for an address with no coins — same shape as rebuildGroups
+  // produces, so renderAddressCard renders it identically (the existing
+  // "empty" meta-row text + zero coin rows fall out naturally).
+  function emptyAddressGroup(addr) {
+    return {
+      address: addr, miniaddress: addr,
+      minimaCoins: [], tokensByTokenid: new Map(),
+      totalMinima: "0", tokenCount: 0,
+    };
+  }
   function renderWallet() {
     const body = document.getElementById("walletBody");
     clearNode(body);
-    if (!state.coins.length) {
+
+    // Coined groups — every address that holds ≥1 coin (from rebuildGroups).
+    const coined = [...state.groups.values()];
+    // Recognise an address as "already coined" via BOTH encodings (the groups
+    // key off c.address, which is the 0x form; the wallet/script lists are
+    // Mx-preferred). Without checking both, an address that holds coins would
+    // double-render — once as coined, once as empty.
+    const coinedKeys = new Set();
+    for (const g of coined) { if (g.address) coinedKeys.add(g.address); if (g.miniaddress) coinedKeys.add(g.miniaddress); }
+    // Empty default-wallet addresses (the 64 seed-derived ones).
+    const emptyDefaults = (state.myWalletAddressList || [])
+      .filter(a => !coinedKeys.has(a))
+      .map(emptyAddressGroup);
+    // Empty tracked contract / script addresses.
+    const emptyScripts = (state.myScriptAddressList || [])
+      .filter(a => !coinedKeys.has(a))
+      .map(emptyAddressGroup);
+
+    // Nothing loaded at all (no coins, no addresses) — keep the CTA card.
+    if (!coined.length && !emptyDefaults.length && !emptyScripts.length) {
       body.appendChild(renderEmptyWallet());
       return;
     }
-    // Sort groups: default wallet first, then by total Minima desc
-    const groups = [...state.groups.values()].sort((a, b) => {
+
+    // Sort coined groups: default wallet first, then by total Minima desc.
+    coined.sort((a, b) => {
       const aDef = state.myWalletAddresses.has(a.address) ? 0 : 1;
       const bDef = state.myWalletAddresses.has(b.address) ? 0 : 1;
       if (aDef !== bDef) return aDef - bDef;
       return bigGt(a.totalMinima, b.totalMinima) ? -1 : 1;
     });
-    for (const g of groups) body.appendChild(renderAddressCard(g));
+    // Order: coined first, then empty defaults (in script-listing order, so the
+    // 64 seed-derived addresses appear in their natural sequence), then empty
+    // tracked contracts.
+    for (const g of coined) body.appendChild(renderAddressCard(g));
+    for (const g of emptyDefaults) body.appendChild(renderAddressCard(g));
+    for (const g of emptyScripts) body.appendChild(renderAddressCard(g));
   }
   function renderEmptyWallet() {
     return el("div", { class: "empty" },
